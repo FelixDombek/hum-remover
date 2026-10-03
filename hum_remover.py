@@ -30,6 +30,9 @@ HOP = N_FFT // 4
 CHUNK = 1 << 20
 PEAK_HALF_WIDTH = 3  # bins on each side of a peak that belong to the hum
 NEIGHBOUR_BINS = 40  # bins on each side used to estimate the masking background
+PROFILE_SAMPLE_FRAMES = 8192
+LEVEL_HISTOGRAM_BINS = 4096
+LEVEL_MIN_DB, LEVEL_MAX_DB = -180.0, 60.0
 WINDOW = np.sqrt(scipy.signal.get_window("hann", N_FFT, fftbins=True))
 WIN_NORM = float(np.sum(WINDOW**2) / HOP)  # sqrt-hann analysis+synthesis OLA gain compensation
 WIN_SUM = float(np.sum(WINDOW)) / 2  # amplitude normalisation so a unit sine gives magnitude ~1
@@ -68,44 +71,97 @@ def band_bins(sr, fmin, fmax):
     return lo, min(hi, N_FFT // 2 + 1)
 
 
-def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print):
+def _validate_band(sr, fmin, fmax):
+    nyquist = sr / 2
+    if not np.isfinite(fmin) or not np.isfinite(fmax) or fmin < 0 or fmax <= fmin or fmax > nyquist:
+        raise ValueError(f"frequency band must satisfy 0 <= fmin < fmax <= Nyquist ({nyquist:g} Hz)")
+
+
+def _iter_band_mags(path, lo, hi, channel):
     info = sf.info(path)
-    sr = info.samplerate
-    lo, hi = band_bins(sr, fmin, fmax)
-    mags = []
     buf = np.zeros((info.channels, 0), np.float32)
     for blk in _read_chunks(path):
         buf = np.concatenate([buf, blk], axis=1)
         fr, used = _frames(buf)
         if used:
             mono = select_channel(fr, channel)
-            mags.append((np.abs(scipy.fft.rfft(mono, axis=-1)[:, lo:hi]) / WIN_SUM).astype(np.float32))
+            yield (np.abs(scipy.fft.rfft(mono, axis=-1)[:, lo:hi]) / WIN_SUM).astype(np.float32)
             buf = buf[:, used:]
-    if not mags:
+
+
+def _level_bins(level):
+    level_db = 20 * np.log10(level)
+    return np.clip(
+        ((level_db - LEVEL_MIN_DB) * LEVEL_HISTOGRAM_BINS / (LEVEL_MAX_DB - LEVEL_MIN_DB)).astype(int),
+        0, LEVEL_HISTOGRAM_BINS - 1)
+
+
+def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print):
+    info = sf.info(path)
+    sr = info.samplerate
+    _validate_band(sr, fmin, fmax)
+    if not 0 < quiet_percent <= 100:
+        raise ValueError("quiet_percent must be greater than 0 and at most 100")
+    lo, hi = band_bins(sr, fmin, fmax)
+    level_histogram = np.zeros(LEVEL_HISTOGRAM_BINS, np.int64)
+    valid_count = 0
+    for mag in _iter_band_mags(path, lo, hi, channel):
+        level = np.median(mag, axis=1)
+        valid = level > 1e-9  # skip digital silence
+        valid_count += int(valid.sum())
+        if valid.any():
+            level_histogram += np.bincount(_level_bins(level[valid]), minlength=LEVEL_HISTOGRAM_BINS)
+    if valid_count == 0:
         raise ValueError("file too short to analyze")
-    mag = np.concatenate(mags)
-    nframes = len(mag)
-    level = np.median(mag, axis=1)
-    valid = level > 1e-9  # skip digital silence
-    if valid.sum() < 4:
+    if valid_count < 4:
         raise ValueError("file is (nearly) digital silence")
-    idx_valid = np.flatnonzero(valid)
-    n_quiet = max(3, int(len(idx_valid) * quiet_percent / 100))
-    quiet = idx_valid[np.argsort(level[idx_valid])[:n_quiet]]
-    profile = np.median(mag[quiet], axis=0)
+    n_quiet = max(3, int(valid_count * quiet_percent / 100))
+    threshold_bin = np.searchsorted(np.cumsum(level_histogram), n_quiet)
+    rng = np.random.default_rng(0)
+    quiet_sample = []
+    quiet_count = 0
+    quiet_first = quiet_last = None
+    frame_offset = 0
+    for mag in _iter_band_mags(path, lo, hi, channel):
+        level = np.median(mag, axis=1)
+        valid = level > 1e-9
+        valid_indices = np.flatnonzero(valid)
+        quiet = valid_indices[_level_bins(level[valid]) <= threshold_bin]
+        for i in quiet:
+            frame_index = frame_offset + int(i)
+            if quiet_first is None:
+                quiet_first = frame_index
+            quiet_last = frame_index
+            quiet_count += 1
+            if len(quiet_sample) < PROFILE_SAMPLE_FRAMES:
+                quiet_sample.append(mag[i].copy())
+            else:
+                replacement = int(rng.integers(quiet_count))
+                if replacement < PROFILE_SAMPLE_FRAMES:
+                    quiet_sample[replacement] = mag[i].copy()
+        frame_offset += len(mag)
+    if not quiet_sample:
+        raise ValueError("file is (nearly) digital silence")
+    profile = np.median(np.asarray(quiet_sample), axis=0)
     baseline = scipy.ndimage.median_filter(profile, size=NEIGHBOUR_BINS + 1, mode="nearest")
     ratio_db = 20 * np.log10((profile + 1e-12) / (baseline + 1e-12))
     peaks, _ = scipy.signal.find_peaks(ratio_db, height=min_prominence_db, distance=2 * PEAK_HALF_WIDTH)
     peaks = peaks[np.argsort(ratio_db[peaks])[::-1][:max_peaks]]
     peaks = np.sort(peaks)
+    audible_counts = np.zeros(len(peaks), np.int64)
+    total_frames = 0
+    for mag in _iter_band_mags(path, lo, hi, channel):
+        total_frames += len(mag)
+        if len(peaks):
+            audible_counts += np.sum(mag[:, peaks] > 2 * baseline[peaks], axis=0)
     result_peaks = []
-    for p in peaks:
+    for j, p in enumerate(peaks):
         # parabolic interpolation on log magnitude for sub-bin frequency
         a, b, c = (np.log(profile[p + d] + 1e-12) if 0 <= p + d < len(profile) else np.log(profile[p] + 1e-12) for d in (-1, 0, 1))
         denom = a - 2 * b + c
         delta = 0.5 * (a - c) / denom if denom != 0 else 0.0
         delta = float(np.clip(delta, -0.5, 0.5))
-        present = float(np.mean(mag[:, p] > 2 * baseline[p]))
+        present = float(audible_counts[j] / total_frames) if total_frames else 0.0
         result_peaks.append({
             "bin": int(p + lo),
             "freq_hz": float((p + lo + delta) * sr / N_FFT),
@@ -116,12 +172,11 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
             "frames_audible_pct": 100 * present,
             "half_width_bins": PEAK_HALF_WIDTH,
         })
-    quiet_times = np.sort(quiet) * HOP / sr
     res = {
         "file": os.path.basename(path), "samplerate": sr, "channels": info.channels, "channel": channel,
         "duration_s": info.frames / sr, "n_fft": N_FFT, "band_hz": [fmin, fmax],
-        "quiet_frames": int(len(quiet)), "quiet_total_s": float(len(quiet) * HOP / sr),
-        "quiet_first_s": float(quiet_times[0]), "quiet_last_s": float(quiet_times[-1]),
+        "quiet_frames": quiet_count, "quiet_total_s": float(quiet_count * HOP / sr),
+        "quiet_first_s": float(quiet_first * HOP / sr), "quiet_last_s": float(quiet_last * HOP / sr),
         "peaks": result_peaks,
     }
     return res
@@ -144,8 +199,14 @@ def print_stats(res, out=print):
 
 def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=print):
     """Stream src through the STFT hum canceller, writing to the open binary file object dst_file."""
+    if mask_db < 0:
+        raise ValueError("mask_db must be nonnegative")
+    if max_reduction_db < 0:
+        raise ValueError("max_reduction_db must be nonnegative")
     info = sf.info(src)
     sr, nch = info.samplerate, info.channels
+    if info.subtype not in sf.available_subtypes("WAV"):
+        raise ValueError(f"unsupported WAV subtype: {info.subtype}")
     peaks = res["peaks"]
     nb = N_FFT // 2 + 1
     amp = np.zeros(nb, np.float32)  # hum amplitude per bin (excess over baseline)
@@ -170,7 +231,7 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
         for a, b, n_lo, n_hi, keep, hum_ref in regions:
             bg = np.median(monomag[:, n_lo:n_hi][:, keep], axis=1)
             d = 20 * np.log10((bg + 1e-12) / hum_ref)
-            s = np.clip(1 - d / mask_db, 0, 1)  # (nfr,)
+            s = np.ones_like(d) if mask_db == 0 else np.clip(1 - d / mask_db, 0, 1)  # (nfr,)
             target = np.maximum(mag[:, :, a:b] - s[:, None, None] * amp[a:b] * WIN_SUM, floor * mag[:, :, a:b])
             gain[:, :, a:b] = target / np.maximum(mag[:, :, a:b], 1e-20)
         out = scipy.fft.irfft(spec * gain, n=N_FFT, axis=-1) * WINDOW
@@ -181,7 +242,7 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
     buf = np.zeros((nch, pad), np.float32)
     carry = np.zeros((nch, pad), np.float32)
     skip, remaining = pad, total
-    subtype = info.subtype if info.subtype in ("PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE") else "PCM_16"
+    subtype = info.subtype
     done = 0
 
     def run(buf):
@@ -237,6 +298,12 @@ def open_new_output(src):
             continue
 
 
+def validate_profile(res, input_path):
+    info = sf.info(input_path)
+    if res.get("samplerate") != info.samplerate or res.get("n_fft") != N_FFT:
+        raise ValueError("profile sample rate or FFT size does not match the input")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["analyze", "remove"])
@@ -260,12 +327,28 @@ def main(argv=None):
 
     if not os.path.isfile(a.input):
         ap.error(f"input not found: {a.input}")
+    if a.save_profile and (
+        os.path.realpath(a.save_profile) == os.path.realpath(a.input)
+        or (os.path.exists(a.save_profile) and os.path.samefile(a.save_profile, a.input))
+    ):
+        ap.error("--save-profile must not resolve to the input file")
+    if a.mask_db < 0:
+        ap.error("--mask-db must be nonnegative")
+    if a.max_reduction_db < 0:
+        ap.error("--max-reduction-db must be nonnegative")
     if a.mode == "remove" and a.profile:
         with open(a.profile) as f:
             res = json.load(f)
+        try:
+            validate_profile(res, a.input)
+        except ValueError as e:
+            ap.error(str(e))
     else:
         print("Analyzing...")
-        res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel)
+        try:
+            res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel)
+        except ValueError as e:
+            ap.error(str(e))
     print_stats(res)
     if a.save_profile:
         with open(a.save_profile, "w") as f:
@@ -275,8 +358,6 @@ def main(argv=None):
     if not res["peaks"]:
         print("Nothing to remove.")
         return 1
-    if a.mask_db <= 0:
-        a.mask_db = 1e-6
     path, fh = open_new_output(a.input)
     try:
         with fh:

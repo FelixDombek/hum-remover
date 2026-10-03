@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import soundfile as sf
 
 import hum_remover as hr
@@ -36,9 +37,10 @@ def test_remove_quiet_part_and_no_overwrite(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p)
     before = open(p, "rb").read()
+    res = hr.analyze(p)
     path, fh = hr.open_new_output(p)
     with fh:
-        hr.remove_hum(p, fh, hr.analyze(p), mask_db=6.0, log=lambda *a, **k: None)
+        hr.remove_hum(p, fh, res, mask_db=6.0, log=lambda *a, **k: None)
     assert path != p and "-nohum-" in path
     assert open(p, "rb").read() == before
     x, _ = sf.read(p)
@@ -48,6 +50,11 @@ def test_remove_quiet_part_and_no_overwrite(tmp_path):
     assert np.std(y[gap, 0]) < 0.6 * np.std(x[gap, 0])
     loud = slice(SR * 5, SR * 15)  # hum masked by music: nearly untouched
     assert np.std(y[loud, 0] - x[loud, 0]) < 0.0005
+    always_path, always_fh = hr.open_new_output(p)
+    with always_fh:
+        hr.remove_hum(p, always_fh, res, mask_db=0, log=lambda *a, **k: None)
+    always, _ = sf.read(always_path)
+    assert np.std(always[loud, 0] - x[loud, 0]) > np.std(y[loud, 0] - x[loud, 0])
 
 
 def test_channel_selector(tmp_path):
@@ -62,6 +69,51 @@ def test_channel_selector(tmp_path):
     assert 0.5 < d < 1.5
 
 
+@pytest.mark.parametrize("fmin,fmax", [
+    (-1, 3000), (2000, 1000), (24000, 25000), (1000, 24001), (float("nan"), 2000),
+])
+def test_analyze_rejects_invalid_frequency_band(tmp_path, fmin, fmax):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    with pytest.raises(ValueError, match="frequency band"):
+        hr.analyze(p, fmin=fmin, fmax=fmax)
+
+
+def test_save_profile_cannot_overwrite_input(tmp_path):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    before = open(p, "rb").read()
+    with pytest.raises(SystemExit):
+        hr.main(["analyze", p, "--save-profile", p])
+    assert open(p, "rb").read() == before
+
+
+def test_profile_must_match_input_metadata(tmp_path):
+    p = str(tmp_path / "a.wav")
+    profile = str(tmp_path / "profile.json")
+    make(p, seconds=2)
+    with open(profile, "w") as f:
+        f.write('{"samplerate": 44100, "n_fft": 8192, "peaks": []}')
+    with pytest.raises(SystemExit):
+        hr.main(["remove", p, "--profile", profile])
+
+
+def test_reject_negative_reduction_settings():
+    with pytest.raises(ValueError, match="max_reduction_db"):
+        hr.remove_hum("unused.wav", None, {}, max_reduction_db=-1)
+    with pytest.raises(ValueError, match="mask_db"):
+        hr.remove_hum("unused.wav", None, {}, mask_db=-1)
+
+
+def test_analysis_profile_sampling_is_bounded(tmp_path, monkeypatch):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=60)
+    monkeypatch.setattr(hr, "PROFILE_SAMPLE_FRAMES", 32)
+    res = hr.analyze(p)
+    assert len(res["peaks"]) == len(HUM)
+    assert res["quiet_frames"] > 32
+
+
 def test_24bit_output_mirrors_input(tmp_path):
     p = str(tmp_path / "a.wav")
     x = np.random.default_rng(0).standard_normal((44100 * 5, 2)) * 0.05
@@ -72,3 +124,12 @@ def test_24bit_output_mirrors_input(tmp_path):
         hr.remove_hum(p, fh, res, log=lambda *a, **k: None)
     i, o = sf.info(p), sf.info(path)
     assert (o.samplerate, o.channels, o.subtype, o.frames) == (44100, 2, "PCM_24", i.frames)
+
+
+def test_8bit_pcm_output_preserves_subtype(tmp_path):
+    p = str(tmp_path / "a.wav")
+    sf.write(p, np.zeros((SR, 2), np.float32), SR, subtype="PCM_U8")
+    path, fh = hr.open_new_output(p)
+    with fh:
+        hr.remove_hum(p, fh, {"peaks": [], "channel": "mix"}, log=lambda *a, **k: None)
+    assert sf.info(path).subtype == "PCM_U8"
