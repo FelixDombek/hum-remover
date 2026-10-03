@@ -48,12 +48,19 @@ def _frames(data):
     return (view.transpose(1, 0, 2) * WINDOW).astype(np.float32), nfr * HOP
 
 
-def _read_chunks(path):
+def _read_chunks(path, start_frame=0, end_frame=None):
     with sf.SoundFile(path) as f:
+        f.seek(start_frame)
+        remaining = None if end_frame is None else end_frame - start_frame
         while True:
-            blk = f.read(CHUNK, dtype="float32", always_2d=True)
+            size = CHUNK if remaining is None else min(CHUNK, remaining)
+            if size <= 0:
+                return
+            blk = f.read(size, dtype="float32", always_2d=True)
             if len(blk) == 0:
                 return
+            if remaining is not None:
+                remaining -= len(blk)
             yield blk.T
 
 
@@ -77,10 +84,10 @@ def _validate_band(sr, fmin, fmax):
         raise ValueError(f"frequency band must satisfy 0 <= fmin < fmax <= Nyquist ({nyquist:g} Hz)")
 
 
-def _iter_band_mags(path, lo, hi, channel):
+def _iter_band_mags(path, lo, hi, channel, start_frame=0, end_frame=None):
     info = sf.info(path)
     buf = np.zeros((info.channels, 0), np.float32)
-    for blk in _read_chunks(path):
+    for blk in _read_chunks(path, start_frame, end_frame):
         buf = np.concatenate([buf, blk], axis=1)
         fr, used = _frames(buf)
         if used:
@@ -96,16 +103,26 @@ def _level_bins(level):
         0, LEVEL_HISTOGRAM_BINS - 1)
 
 
-def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print):
+def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None):
     info = sf.info(path)
     sr = info.samplerate
     _validate_band(sr, fmin, fmax)
     if not 0 < quiet_percent <= 100:
         raise ValueError("quiet_percent must be greater than 0 and at most 100")
+    duration = info.frames / sr
+    if start is None:
+        start = 0.0
+    if end is None:
+        end = duration
+    if not np.isfinite(start) or not np.isfinite(end) or start < 0 or end <= start or end > duration:
+        raise ValueError(f"analysis range must satisfy 0 <= start < end <= file duration ({duration:.3f} s)")
+    start_frame, end_frame = round(start * sr), round(end * sr)
+    if end_frame - start_frame < N_FFT:
+        raise ValueError(f"analysis range must contain at least {N_FFT / sr:.3f} seconds of audio")
     lo, hi = band_bins(sr, fmin, fmax)
     level_histogram = np.zeros(LEVEL_HISTOGRAM_BINS, np.int64)
     valid_count = 0
-    for mag in _iter_band_mags(path, lo, hi, channel):
+    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
         level = np.median(mag, axis=1)
         valid = level > 1e-9  # skip digital silence
         valid_count += int(valid.sum())
@@ -122,16 +139,16 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
     quiet_count = 0
     quiet_first = quiet_last = None
     frame_offset = 0
-    for mag in _iter_band_mags(path, lo, hi, channel):
+    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
         level = np.median(mag, axis=1)
         valid = level > 1e-9
         valid_indices = np.flatnonzero(valid)
         quiet = valid_indices[_level_bins(level[valid]) <= threshold_bin]
         for i in quiet:
-            frame_index = frame_offset + int(i)
+            frame_time = (start_frame + (frame_offset + int(i)) * HOP) / sr
             if quiet_first is None:
-                quiet_first = frame_index
-            quiet_last = frame_index
+                quiet_first = frame_time
+            quiet_last = frame_time
             quiet_count += 1
             if len(quiet_sample) < PROFILE_SAMPLE_FRAMES:
                 quiet_sample.append(mag[i].copy())
@@ -150,7 +167,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
     peaks = np.sort(peaks)
     audible_counts = np.zeros(len(peaks), np.int64)
     total_frames = 0
-    for mag in _iter_band_mags(path, lo, hi, channel):
+    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
         total_frames += len(mag)
         if len(peaks):
             audible_counts += np.sum(mag[:, peaks] > 2 * baseline[peaks], axis=0)
@@ -174,9 +191,11 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         })
     res = {
         "file": os.path.basename(path), "samplerate": sr, "channels": info.channels, "channel": channel,
-        "duration_s": info.frames / sr, "n_fft": N_FFT, "band_hz": [fmin, fmax],
+        "duration_s": duration, "analysis_duration_s": (end_frame - start_frame) / sr,
+        "analysis_start_s": start_frame / sr, "analysis_end_s": end_frame / sr,
+        "n_fft": N_FFT, "band_hz": [fmin, fmax],
         "quiet_frames": quiet_count, "quiet_total_s": float(quiet_count * HOP / sr),
-        "quiet_first_s": float(quiet_first * HOP / sr), "quiet_last_s": float(quiet_last * HOP / sr),
+        "quiet_first_s": float(quiet_first), "quiet_last_s": float(quiet_last),
         "peaks": result_peaks,
     }
     return res
@@ -185,6 +204,8 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
 def print_stats(res, out=print):
     out(f"File: {res['file']}  {res['samplerate']} Hz, {res['channels']} ch, {res['duration_s'] / 60:.1f} min"
         f"  [analysed channel: {res.get('channel', 'mix')}]")
+    if "analysis_start_s" in res and (res["analysis_start_s"] != 0 or res["analysis_end_s"] != res["duration_s"]):
+        out(f"Analyzed interval: {res['analysis_start_s']:.2f}-{res['analysis_end_s']:.2f} s")
     out(f"Band searched: {res['band_hz'][0]:.0f}-{res['band_hz'][1]:.0f} Hz, "
         f"quiet reference: {res['quiet_frames']} frames (~{res['quiet_total_s']:.0f} s, "
         f"between {res['quiet_first_s']:.0f}s and {res['quiet_last_s']:.0f}s)")
@@ -304,6 +325,33 @@ def validate_profile(res, input_path):
         raise ValueError("profile sample rate or FFT size does not match the input")
 
 
+def parse_time(value):
+    """Parse seconds, MM:SS, or HH:MM:SS into seconds."""
+    try:
+        parts = value.split(":")
+        if len(parts) == 1:
+            seconds = float(parts[0])
+        elif len(parts) == 2:
+            minutes = int(parts[0])
+            seconds_part = float(parts[1])
+            if minutes < 0 or not 0 <= seconds_part < 60:
+                raise ValueError
+            seconds = minutes * 60 + seconds_part
+        elif len(parts) == 3:
+            hours, minutes = int(parts[0]), int(parts[1])
+            seconds_part = float(parts[2])
+            if hours < 0 or not 0 <= minutes < 60 or not 0 <= seconds_part < 60:
+                raise ValueError
+            seconds = hours * 3600 + minutes * 60 + seconds_part
+        else:
+            raise ValueError
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("time must be seconds, MM:SS, or HH:MM:SS") from e
+    if not np.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("time must be a finite nonnegative value")
+    return seconds
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["analyze", "remove"])
@@ -316,6 +364,8 @@ def main(argv=None):
                     help="channel used for hum detection and for the audibility/masking decision "
                          "(removal itself is applied to all channels)")
     ap.add_argument("--max-peaks", type=int, default=12)
+    ap.add_argument("--start", type=parse_time, help="analyze from this time (seconds, MM:SS, or HH:MM:SS)")
+    ap.add_argument("--end", type=parse_time, help="analyze until this time (seconds, MM:SS, or HH:MM:SS)")
     ap.add_argument("--save-profile", help="analyze: write identified hum profile to this JSON file")
     ap.add_argument("--profile", help="remove: use this JSON profile instead of analysing the input again")
     ap.add_argument("--mask-db", type=float, default=12.0,
@@ -346,7 +396,8 @@ def main(argv=None):
     else:
         print("Analyzing...")
         try:
-            res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel)
+            res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel,
+                          start=a.start or 0.0, end=a.end)
         except ValueError as e:
             ap.error(str(e))
     print_stats(res)

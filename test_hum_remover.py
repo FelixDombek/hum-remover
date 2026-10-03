@@ -1,3 +1,5 @@
+import argparse
+
 import numpy as np
 import pytest
 import soundfile as sf
@@ -31,6 +33,48 @@ def test_analyze_finds_hum(tmp_path):
     assert len(found) == len(HUM)
     for f, g in zip(sorted(HUM), found):
         assert abs(f - g) < 6
+
+
+def test_analyze_time_range_detects_only_selected_segment(tmp_path):
+    p = str(tmp_path / "segments.wav")
+    t = np.arange(SR * 4) / SR
+    signal = np.zeros_like(t)
+    signal[:SR * 2] = 0.01 * np.sin(2 * np.pi * 1800 * t[:SR * 2])
+    signal[SR * 2:] = 0.01 * np.sin(2 * np.pi * 2400 * t[SR * 2:])
+    sf.write(p, signal, SR, subtype="FLOAT")
+
+    res = hr.analyze(p, start=2, end=4)
+    assert len(res["peaks"]) == 1
+    assert abs(res["peaks"][0]["freq_hz"] - 2400) < 3
+    assert res["analysis_start_s"] == 2
+    assert res["analysis_end_s"] == 4
+    assert res["analysis_duration_s"] == 2
+    assert res["duration_s"] == 4
+    assert res["quiet_first_s"] >= 2
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("35:10", 2110),
+    ("1:02:03.5", 3723.5),
+    ("12.5", 12.5),
+])
+def test_parse_time(value, expected):
+    assert hr.parse_time(value) == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "1:60", "1:2:60", "1:2:3:4", "nope"])
+def test_parse_time_rejects_invalid_values(value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        hr.parse_time(value)
+
+
+def test_analyze_rejects_invalid_time_range(tmp_path):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    with pytest.raises(ValueError, match="analysis range"):
+        hr.analyze(p, start=1.5, end=1)
+    with pytest.raises(ValueError, match="analysis range"):
+        hr.analyze(p, start=0, end=3)
 
 
 def test_remove_quiet_part_and_no_overwrite(tmp_path):
