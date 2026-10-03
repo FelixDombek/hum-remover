@@ -17,6 +17,9 @@ python hum_remover.py remove  concert.wav [--profile hum.json] [--mask-db 12] [-
 `remove` writes `concert-nohum-<random>.wav` next to the input; existing files (including the input) are never
 overwritten.
 
+`--channel left|right|mix` (default `mix`) selects the channel used for detection and the masking decision, so you
+can compare analyze results per channel. Output mirrors the input's sample rate, channel count and bit depth.
+
 ## How it works
 1. **Detection**: an STFT (8192 pt, 75 % overlap) of the mono mix is computed over the hum band. The quietest
    frames (`--quiet-percent`, default 10 %) are used as reference, since the hum is most audible there. Their median

@@ -54,13 +54,21 @@ def _read_chunks(path):
             yield blk.T
 
 
+def select_channel(x, channel, axis=1):
+    """Reduce the channel axis of x to one signal: 'left', 'right' or 'mix' (mean of all channels)."""
+    n = x.shape[axis]
+    if channel == "mix" or n == 1:
+        return x.mean(axis=axis)
+    return np.take(x, 0 if channel == "left" else 1, axis=axis)
+
+
 def band_bins(sr, fmin, fmax):
     lo = int(np.floor(fmin * N_FFT / sr))
     hi = int(np.ceil(fmax * N_FFT / sr)) + 1
     return lo, min(hi, N_FFT // 2 + 1)
 
 
-def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, log=print):
+def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print):
     info = sf.info(path)
     sr = info.samplerate
     lo, hi = band_bins(sr, fmin, fmax)
@@ -70,7 +78,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         buf = np.concatenate([buf, blk], axis=1)
         fr, used = _frames(buf)
         if used:
-            mono = fr.mean(axis=1)
+            mono = select_channel(fr, channel)
             mags.append((np.abs(scipy.fft.rfft(mono, axis=-1)[:, lo:hi]) / WIN_SUM).astype(np.float32))
             buf = buf[:, used:]
     if not mags:
@@ -110,7 +118,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         })
     quiet_times = np.sort(quiet) * HOP / sr
     res = {
-        "file": os.path.basename(path), "samplerate": sr, "channels": info.channels,
+        "file": os.path.basename(path), "samplerate": sr, "channels": info.channels, "channel": channel,
         "duration_s": info.frames / sr, "n_fft": N_FFT, "band_hz": [fmin, fmax],
         "quiet_frames": int(len(quiet)), "quiet_total_s": float(len(quiet) * HOP / sr),
         "quiet_first_s": float(quiet_times[0]), "quiet_last_s": float(quiet_times[-1]),
@@ -120,7 +128,8 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
 
 
 def print_stats(res, out=print):
-    out(f"File: {res['file']}  {res['samplerate']} Hz, {res['channels']} ch, {res['duration_s'] / 60:.1f} min")
+    out(f"File: {res['file']}  {res['samplerate']} Hz, {res['channels']} ch, {res['duration_s'] / 60:.1f} min"
+        f"  [analysed channel: {res.get('channel', 'mix')}]")
     out(f"Band searched: {res['band_hz'][0]:.0f}-{res['band_hz'][1]:.0f} Hz, "
         f"quiet reference: {res['quiet_frames']} frames (~{res['quiet_total_s']:.0f} s, "
         f"between {res['quiet_first_s']:.0f}s and {res['quiet_last_s']:.0f}s)")
@@ -156,7 +165,7 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
     def process(fr):
         spec = scipy.fft.rfft(fr, axis=-1)  # (nfr, ch, nb)
         mag = np.abs(spec)
-        monomag = np.abs(spec.mean(axis=1)) / WIN_SUM
+        monomag = np.abs(select_channel(spec, res.get("channel", "mix"))) / WIN_SUM
         gain = np.ones_like(mag)
         for a, b, n_lo, n_hi, keep, hum_ref in regions:
             bg = np.median(monomag[:, n_lo:n_hi][:, keep], axis=1)
@@ -236,6 +245,9 @@ def main(argv=None):
     ap.add_argument("--fmax", type=float, default=3000.0, help="upper edge of hum search band in Hz")
     ap.add_argument("--quiet-percent", type=float, default=10.0, help="%% of quietest frames used as hum reference")
     ap.add_argument("--min-prominence-db", type=float, default=6.0, help="min. peak height over local baseline")
+    ap.add_argument("--channel", choices=["left", "right", "mix"], default="mix",
+                    help="channel used for hum detection and for the audibility/masking decision "
+                         "(removal itself is applied to all channels)")
     ap.add_argument("--max-peaks", type=int, default=12)
     ap.add_argument("--save-profile", help="analyze: write identified hum profile to this JSON file")
     ap.add_argument("--profile", help="remove: use this JSON profile instead of analysing the input again")
@@ -253,7 +265,7 @@ def main(argv=None):
             res = json.load(f)
     else:
         print("Analyzing...")
-        res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks)
+        res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel)
     print_stats(res)
     if a.save_profile:
         with open(a.save_profile, "w") as f:
