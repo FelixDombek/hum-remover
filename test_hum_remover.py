@@ -111,6 +111,15 @@ def test_analyze_channels_reports_silent_channel_without_aborting(tmp_path):
     assert results["right"]["quiet_last_s"] is None
 
 
+def test_channel_results_are_deterministic_independent_of_batch(tmp_path, monkeypatch):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=10)
+    monkeypatch.setattr(hr, "PROFILE_SAMPLE_FRAMES", 16)
+    all_channels = hr.analyze_channels(p, progress=lambda _: None)
+    right_only = hr.analyze(p, channel="right", progress=lambda _: None)
+    assert all_channels["right"] == right_only
+
+
 def test_all_channel_progress_tracks_three_analysis_phases(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
@@ -132,11 +141,12 @@ def test_analyze_progress_reaches_completion(tmp_path):
     assert updates == sorted(updates)
 
 
-def test_analyze_log_argument_warns_that_it_is_ignored(tmp_path):
+def test_analyze_log_receives_status_text(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
-    with pytest.warns(FutureWarning, match=r"log=\.\.\.\) is ignored"):
-        hr.analyze(p, log=lambda *args: None, progress=lambda _: None)
+    messages = []
+    hr.analyze(p, log=messages.append, progress=lambda _: None)
+    assert messages == ["Analyzing mix...", "Analysis complete: mix"]
 
 
 def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):

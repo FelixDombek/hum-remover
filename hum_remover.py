@@ -20,7 +20,6 @@ import os
 import secrets
 import struct
 import sys
-import warnings
 from contextlib import contextmanager
 from tempfile import SpooledTemporaryFile
 from xml.sax.saxutils import escape
@@ -232,13 +231,13 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
-    """Analyze one channel; `log` is ignored and will be removed, use `progress` instead."""
-    if log is not print:
-        warnings.warn("analyze(log=...) is ignored; use progress=... instead",
-                      FutureWarning, stacklevel=2)
-    return analyze_channels(
+    """Analyze one channel; `log` receives status text and `progress` receives fractions."""
+    log(f"Analyzing {channel}...")
+    result = analyze_channels(
         path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
         start=start, end=end, hum_only=hum_only, progress=progress)[channel]
+    log(f"Analysis complete: {channel}")
+    return result
 
 
 def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
@@ -287,6 +286,7 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
             if valid.any() and not hum_only:
                 level_histograms[index] += np.bincount(
                     _level_bins(levels[valid, index]), minlength=LEVEL_HISTOGRAM_BINS)
+    report_progress(1 / 3)
     active_channels = valid_counts >= 4
     if not np.any(active_channels):
         silent = ", ".join(channels)
@@ -302,7 +302,8 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
             n_quiet = max(3, int(valid_counts[index] * quiet_percent / 100))
             threshold_bins.append(np.searchsorted(np.cumsum(level_histograms[index]), n_quiet))
 
-    rngs = [np.random.default_rng(index) for index in range(len(channels))]
+    channel_seeds = {"mix": 0, "left": 1, "right": 2}
+    rngs = [np.random.default_rng(channel_seeds[channel]) for channel in channels]
     quiet_samples = [[] for _ in channels]
     quiet_counts = np.zeros(len(channels), np.int64)
     quiet_first = [None for _ in channels]
@@ -331,6 +332,7 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
                     if replacement < PROFILE_SAMPLE_FRAMES:
                         sample[replacement] = mags[i, index].copy()
         frame_offset += len(mags)
+    report_progress(2 / 3)
     profiles, baselines, ratios, peaks_by_channel = [], [], [], []
     for index, sample in enumerate(quiet_samples):
         if not active_channels[index]:
@@ -471,7 +473,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         frame_offset = 0
 
         def flush_column():
-            if current_column is None or not np.any(column_values):
+            if current_column is None:
                 return
             colors = np.clip(
                 ((20 * np.log10(column_values + SPECTROGRAM_AMP_FLOOR) - SPECTROGRAM_DB_FLOOR)
@@ -495,6 +497,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
                     current_column = x
                 elif x != current_column:
                     flush_column()
+                    # Missing time columns repeat the prior rendered column; silence is palette index zero.
                     if x > current_column + 1:
                         pixels[:, current_column + 1:x] = pixels[:, current_column, None]
                     column_values.fill(0)
@@ -744,10 +747,10 @@ def main(argv=None):
         ap.error("--max-reduction-db must be nonnegative")
     if a.spectrogram is not None and a.mode != "analyze":
         ap.error("--spectrogram is only available in analyze mode")
-    channels = ([a.channel] if a.channel else
-                ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
+    channels = None
     spectrogram_paths = {}
     if a.spectrogram is not None:
+        channels = ([a.channel] if a.channel else ["mix", "left", "right"])
         try:
             _spectrogram_geometry(
                 sf.info(a.input), a.fmin, a.fmax, a.start or 0.0, a.end,
@@ -773,6 +776,9 @@ def main(argv=None):
         print_stats(res)
     else:
         print("Analyzing...")
+        if channels is None:
+            channels = ([a.channel] if a.channel else
+                        ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
         try:
             results = analyze_channels(
                 a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db,
@@ -786,8 +792,9 @@ def main(argv=None):
                         output_path = spectrogram_paths[channel]
                         write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
-                    except Exception as e:
-                        print(f"Spectrogram for {channel} failed: {e}", file=sys.stderr)
+                    except (OSError, ValueError, RuntimeError) as e:
+                        print(f"Spectrogram for {channel} failed ({type(e).__name__}): {e}",
+                              file=sys.stderr)
                         spectrogram_failed = True
                         continue
                     print(f"Spectrogram written to {output_path}")
