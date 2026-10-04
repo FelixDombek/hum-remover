@@ -113,6 +113,15 @@ def test_spectrogram_rejects_invalid_resolution(tmp_path, x_resolution, y_resolu
     assert not (tmp_path / "chart.svg").exists()
 
 
+def test_spectrogram_escapes_svg_text(tmp_path):
+    p = str(tmp_path / "a.wav")
+    out = str(tmp_path / "chart.svg")
+    make(p, seconds=2)
+    hr.write_spectrogram(p, out, channel="mix & <test>")
+    text = "".join(ET.parse(out).getroot().itertext())
+    assert "mix & <test>" in text
+
+
 def test_cli_generates_spectrogram_for_all_channels(tmp_path, capsys):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)

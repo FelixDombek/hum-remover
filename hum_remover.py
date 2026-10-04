@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import sys
+from xml.sax.saxutils import escape
 
 import numpy as np
 import scipy.fft
@@ -34,6 +35,10 @@ PROFILE_SAMPLE_FRAMES = 8192
 LEVEL_HISTOGRAM_BINS = 4096
 LEVEL_MIN_DB, LEVEL_MAX_DB = -180.0, 60.0
 PROGRESS_WIDTH = 28
+SPECTROGRAM_PALETTE_SIZE = 64
+SPECTROGRAM_DB_FLOOR = -100.0
+SPECTROGRAM_DB_CEILING = 0.0
+SPECTROGRAM_AMP_FLOOR = 1e-12
 WINDOW = np.sqrt(scipy.signal.get_window("hann", N_FFT, fftbins=True))
 WIN_NORM = float(np.sum(WINDOW**2) / HOP)  # sqrt-hann analysis+synthesis OLA gain compensation
 WIN_SUM = float(np.sum(WINDOW)) / 2  # amplitude normalisation so a unit sine gives magnitude ~1
@@ -110,6 +115,31 @@ def _show_progress(label, fraction, stream=sys.stderr):
     stream.flush()
 
 
+def _progress_reporter(callback):
+    last = -1.0
+
+    def report(fraction):
+        nonlocal last
+        fraction = float(np.clip(fraction, 0.0, 1.0))
+        if fraction > last:
+            callback(fraction)
+            last = fraction
+
+    return report
+
+
+def _spectrogram_palette():
+    anchors = np.asarray([[8, 20, 38], [18, 91, 145], [20, 184, 166], [255, 230, 109]], np.float32)
+    palette = []
+    for index in range(SPECTROGRAM_PALETTE_SIZE):
+        position = index / (SPECTROGRAM_PALETTE_SIZE - 1) * (len(anchors) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(anchors) - 1)
+        rgb = np.rint(anchors[lower] + (anchors[upper] - anchors[lower]) * (position - lower)).astype(int)
+        palette.append("#" + "".join(f"{value:02x}" for value in rgb))
+    return palette
+
+
 def _level_bins(level):
     level_db = 20 * np.log10(level)
     return np.clip(
@@ -135,7 +165,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         raise ValueError(f"analysis range must contain at least {N_FFT / sr:.3f} seconds of audio")
     lo, hi = band_bins(sr, fmin, fmax)
     expected_frames = (end_frame - start_frame - N_FFT) // HOP + 1
-    report_progress = progress or (lambda fraction: _show_progress(f"Analyze {channel}", fraction))
+    report_progress = _progress_reporter(progress or (lambda fraction: _show_progress(f"Analyze {channel}", fraction)))
     level_histogram = np.zeros(LEVEL_HISTOGRAM_BINS, np.int64)
     valid_count = 0
     frame_count = 0
@@ -224,6 +254,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         "quiet_first_s": float(quiet_first), "quiet_last_s": float(quiet_last),
         "peaks": result_peaks,
     }
+    report_progress(1.0)
     return res
 
 
@@ -259,16 +290,8 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
     bin_freqs = np.arange(lo, hi) * sr / N_FFT
     plot_freqs = fmin + (np.arange(height) + 0.5) * (fmax - fmin) / height
     expected_frames = max(1, (end_frame - start_frame - N_FFT) // HOP + 1)
-    report_progress = progress or (lambda fraction: _show_progress(f"Spectrogram {channel}", fraction))
-
-    anchors = np.asarray([[8, 20, 38], [18, 91, 145], [20, 184, 166], [255, 230, 109]], np.float32)
-    palette = []
-    for index in range(64):
-        position = index / 63 * (len(anchors) - 1)
-        lower = int(position)
-        upper = min(lower + 1, len(anchors) - 1)
-        rgb = np.rint(anchors[lower] + (anchors[upper] - anchors[lower]) * (position - lower)).astype(int)
-        palette.append("#" + "".join(f"{value:02x}" for value in rgb))
+    report_progress = _progress_reporter(progress or (lambda fraction: _show_progress(f"Spectrogram {channel}", fraction)))
+    palette = _spectrogram_palette()
 
     margin_left, margin_top, margin_right, margin_bottom = 70, 20, 20, 55
     svg_width = width + margin_left + margin_right
@@ -277,7 +300,9 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         svg.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}" '
                   f'viewBox="0 0 {svg_width} {svg_height}">\n')
         svg.write(f'<rect width="{svg_width}" height="{svg_height}" fill="{palette[0]}"/>\n')
-        svg.write(f'<text x="{margin_left}" y="14" fill="white">Spectrogram: {channel}</text>\n')
+        svg.write(f'<text x="{margin_left}" y="14" fill="white">Spectrogram: {escape(channel)} '
+                  f'(magnitude {SPECTROGRAM_DB_FLOOR:g} to {SPECTROGRAM_DB_CEILING:g} dBFS, '
+                  f'brighter is stronger)</text>\n')
         svg.write(f'<g transform="translate({margin_left},{margin_top})">\n')
         current_column = None
         column_values = np.zeros(height, np.float32)
@@ -286,7 +311,11 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         def flush_column():
             if current_column is None or not np.any(column_values):
                 return
-            colors = np.clip(((20 * np.log10(column_values + 1e-12) + 100) * 63 / 100).astype(int), 0, 63)
+            colors = np.clip(
+                ((20 * np.log10(column_values + SPECTROGRAM_AMP_FLOOR) - SPECTROGRAM_DB_FLOOR)
+                 * (SPECTROGRAM_PALETTE_SIZE - 1)
+                 / (SPECTROGRAM_DB_CEILING - SPECTROGRAM_DB_FLOOR)).astype(int),
+                0, SPECTROGRAM_PALETTE_SIZE - 1)
             colors = colors[::-1]
             runs = {}
             y = 0
@@ -324,7 +353,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         svg.write(f'<text x="14" y="{margin_top + height / 2}" fill="white" '
                   f'transform="rotate(-90 14 {margin_top + height / 2})" text-anchor="middle">'
                   f'Frequency (Hz), {fmin:g}-{fmax:g}</text>\n')
-        svg.write(f'<g fill="white" font-size="10">')
+        svg.write('<g fill="white" font-size="10">')
         for tick in range(6):
             x = margin_left + width * tick / 5
             seconds = start_s + plot_duration * tick / 5
@@ -333,6 +362,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
             frequency = fmax - (fmax - fmin) * tick / 5
             svg.write(f'<text x="{margin_left-5}" y="{y:.1f}" text-anchor="end">{frequency:.0f}</text>')
         svg.write("</g>\n</svg>\n")
+    report_progress(1.0)
     return output_path
 
 
@@ -356,7 +386,7 @@ def print_stats(res, out=print):
         out(f"  {i:2d}  {p['freq_hz']:9.1f}   {p['level_db']:11.1f}   {p['prominence_db']:15.1f}   {p['frames_audible_pct']:19.1f}")
 
 
-def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=print):
+def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=print, progress=None):
     """Stream src through the STFT hum canceller, writing to the open binary file object dst_file."""
     if mask_db < 0:
         raise ValueError("mask_db must be nonnegative")
@@ -403,6 +433,11 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
     skip, remaining = pad, total
     subtype = info.subtype
     done = 0
+    custom_log = progress is None and log is not print
+    progress_callback = progress or (
+        (lambda fraction: log("\r" + _progress_line("Remove", fraction), end="", flush=True))
+        if custom_log else (lambda fraction: _show_progress("Remove", fraction)))
+    report_progress = _progress_reporter(progress_callback)
 
     def run(buf):
         nonlocal carry, skip, remaining
@@ -430,9 +465,9 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
             if e is not None and e.shape[1]:
                 out.write(e.T if subtype in ("FLOAT", "DOUBLE") else np.clip(e.T, -1.0, 1.0))
                 done += e.shape[1]
-                log("\r" + _progress_line("Remove", done / max(total, 1)), end="", flush=True)
+                report_progress(done / max(total, 1))
 
-        log("\r" + _progress_line("Remove", 0.0), end="", flush=True)
+        report_progress(0.0)
         for blk in _read_chunks(src):
             buf = np.concatenate([buf, blk], axis=1)
             buf, e = run(buf)
@@ -440,7 +475,9 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
         buf = np.concatenate([buf, np.zeros((nch, N_FFT + HOP), np.float32)], axis=1)
         buf, e = run(buf)
         write(e)
-        log("")
+        report_progress(1.0)
+        if custom_log:
+            log("")
 
 
 def make_output_path(src):
