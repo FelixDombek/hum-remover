@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import sys
+from contextlib import contextmanager
 from xml.sax.saxutils import escape
 
 import numpy as np
@@ -145,6 +146,22 @@ def _spectrogram_palette():
     return palette
 
 
+@contextmanager
+def _exclusive_text_output(path):
+    output = open(path, "x", encoding="utf-8")
+    try:
+        yield output
+    except BaseException:
+        output.close()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    finally:
+        output.close()
+
+
 def _level_bins(level):
     level_db = 20 * np.log10(level)
     return np.clip(
@@ -153,6 +170,7 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
+    """Analyze one channel; `log` is retained for compatibility and deprecated in favor of `progress`."""
     return analyze_channels(
         path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
         start=start, end=end, hum_only=hum_only, progress=progress)[channel]
@@ -181,7 +199,7 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
     if end_frame - start_frame < N_FFT:
         raise ValueError(f"analysis range must contain at least {N_FFT / sr:.3f} seconds of audio")
     lo, hi = band_bins(sr, fmin, fmax)
-    expected_frames = (end_frame - start_frame - N_FFT) // HOP + 1
+    expected_frames = max(1, (end_frame - start_frame - N_FFT) // HOP + 1)
     channel_label = "/".join(channels)
     report_progress = _progress_reporter(
         progress if progress is not None else
@@ -341,7 +359,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
     margin_left, margin_top, margin_right, margin_bottom = 70, 20, 20, 55
     svg_width = width + margin_left + margin_right
     svg_height = height + margin_top + margin_bottom
-    with open(output_path, "x", encoding="utf-8") as svg:
+    with _exclusive_text_output(output_path) as svg:
         svg.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}" '
                   f'viewBox="0 0 {svg_width} {svg_height}">\n')
         svg.write(f'<rect width="{svg_width}" height="{svg_height}" fill="{palette[0]}"/>\n')
@@ -362,17 +380,15 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
                  / (SPECTROGRAM_DB_CEILING - SPECTROGRAM_DB_FLOOR)).astype(int),
                 0, SPECTROGRAM_PALETTE_SIZE - 1)
             colors = colors[::-1]
-            runs = {}
-            y = 0
-            while y < height:
-                color = colors[y]
-                end_y = y + 1
-                while end_y < height and colors[end_y] == color:
-                    end_y += 1
-                runs.setdefault(color, []).append(f"M{current_column} {y}h1v{end_y-y}h-1z")
-                y = end_y
-            for color, commands in runs.items():
-                svg.write(f'<path fill="{palette[color]}" d="{"".join(commands)}"/>\n')
+            boundaries = np.r_[0, np.flatnonzero(np.diff(colors)) + 1, height]
+            run_starts, run_lengths = boundaries[:-1], np.diff(boundaries)
+            run_colors = colors[run_starts]
+            for color in np.unique(run_colors):
+                selected = run_colors == color
+                commands = "".join(
+                    f"M{current_column} {y}h1v{length}h-1z"
+                    for y, length in zip(run_starts[selected], run_lengths[selected]))
+                svg.write(f'<path fill="{palette[color]}" d="{commands}"/>\n')
 
         total_frames = 0
         report_progress(0.0)
@@ -651,7 +667,6 @@ def main(argv=None):
                 hum_only=a.hum_only)
             for channel in channels:
                 result = results[channel]
-                results[channel] = result
                 print_stats(result)
                 if a.spectrogram is not None:
                     try:
