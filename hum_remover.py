@@ -232,10 +232,10 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
-    """Analyze one channel; `log` is ignored and deprecated, use `progress` instead."""
+    """Analyze one channel; `log` is ignored and will be removed, use `progress` instead."""
     if log is not print:
         warnings.warn("analyze(log=...) is ignored; use progress=... instead",
-                      DeprecationWarning, stacklevel=2)
+                      FutureWarning, stacklevel=2)
     return analyze_channels(
         path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
         start=start, end=end, hum_only=hum_only, progress=progress)[channel]
@@ -391,8 +391,8 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
             "reference_mode": "hum-only" if hum_only else "quietest",
             "quiet_frames": int(quiet_counts[index]),
             "quiet_total_s": float(quiet_counts[index] * HOP / sr),
-            "quiet_first_s": float(quiet_first[index] or 0),
-            "quiet_last_s": float(quiet_last[index] or 0),
+            "quiet_first_s": float(quiet_first[index]) if quiet_first[index] is not None else None,
+            "quiet_last_s": float(quiet_last[index]) if quiet_last[index] is not None else None,
             "peaks": result_peaks,
         }
     report_progress(1.0)
@@ -548,6 +548,8 @@ def print_stats(res, out=print):
     band = f"Band searched: {res['band_hz'][0]:.0f}-{res['band_hz'][1]:.0f} Hz"
     if res.get("reference_mode") == "hum-only":
         out(f"{band}, hum-only reference: {res['quiet_frames']} frames")
+    elif not res["quiet_frames"]:
+        out(f"{band}, no non-silent reference frames")
     else:
         out(f"{band}, quiet reference: {res['quiet_frames']} frames (~{res['quiet_total_s']:.0f} s, "
             f"between {res['quiet_first_s']:.0f}s and {res['quiet_last_s']:.0f}s)")
@@ -784,7 +786,7 @@ def main(argv=None):
                         output_path = spectrogram_paths[channel]
                         write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
-                    except (OSError, ValueError) as e:
+                    except Exception as e:
                         print(f"Spectrogram for {channel} failed: {e}", file=sys.stderr)
                         spectrogram_failed = True
                         continue

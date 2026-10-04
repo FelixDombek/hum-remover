@@ -107,6 +107,8 @@ def test_analyze_channels_reports_silent_channel_without_aborting(tmp_path):
     assert results["mix"]["peaks"]
     assert results["right"]["peaks"] == []
     assert results["right"]["quiet_frames"] == 0
+    assert results["right"]["quiet_first_s"] is None
+    assert results["right"]["quiet_last_s"] is None
 
 
 def test_all_channel_progress_tracks_three_analysis_phases(tmp_path):
@@ -133,7 +135,7 @@ def test_analyze_progress_reaches_completion(tmp_path):
 def test_analyze_log_argument_warns_that_it_is_ignored(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
-    with pytest.warns(DeprecationWarning, match=r"log=\.\.\.\) is ignored"):
+    with pytest.warns(FutureWarning, match=r"log=\.\.\.\) is ignored"):
         hr.analyze(p, log=lambda *args: None, progress=lambda _: None)
 
 
@@ -288,7 +290,7 @@ def test_cli_continues_other_spectrograms_after_one_fails(tmp_path, monkeypatch,
 
     def fail_chart(path, output, channel, *args, **kwargs):
         channels.append(channel)
-        raise FileExistsError("output appeared during analysis")
+        raise RuntimeError("chart read failed")
 
     monkeypatch.setattr(hr, "write_spectrogram", fail_chart)
     assert hr.main(["analyze", p, "--spectrogram"]) == 1

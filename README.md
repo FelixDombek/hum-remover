@@ -29,7 +29,8 @@ each analyzed channel, limited to the selected time and frequency ranges. Its de
 0.1 seconds and 1 vertical pixel per Hz; adjust them with `--x-resolution` and `--y-resolution`. Images are capped
 at 64 million pixels. If no SVG filename is given, unique files are created next to the input. Creating each
 channel's spectrogram requires an additional streaming FFT pass over the selected audio range. Color indicates
-magnitude from -100 to 0 dBFS; brighter colors indicate stronger frequencies.
+magnitude from -100 to 0 dBFS; brighter colors indicate stronger frequencies. The chart buffer uses one byte per
+pixel (up to 64 MB), independent of audio duration once the requested output dimensions are fixed.
 `remove` writes `concert-nohum-<random>.wav` next to the input; existing files (including the input) are never
 overwritten.
 
