@@ -33,6 +33,7 @@ NEIGHBOUR_BINS = 40  # bins on each side used to estimate the masking background
 PROFILE_SAMPLE_FRAMES = 8192
 LEVEL_HISTOGRAM_BINS = 4096
 LEVEL_MIN_DB, LEVEL_MAX_DB = -180.0, 60.0
+PROGRESS_WIDTH = 28
 WINDOW = np.sqrt(scipy.signal.get_window("hann", N_FFT, fftbins=True))
 WIN_NORM = float(np.sum(WINDOW**2) / HOP)  # sqrt-hann analysis+synthesis OLA gain compensation
 WIN_SUM = float(np.sum(WINDOW)) / 2  # amplitude normalisation so a unit sine gives magnitude ~1
@@ -96,6 +97,19 @@ def _iter_band_mags(path, lo, hi, channel, start_frame=0, end_frame=None):
             buf = buf[:, used:]
 
 
+def _progress_line(label, fraction):
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    filled = int(PROGRESS_WIDTH * fraction)
+    return f"{label} [{'#' * filled}{'-' * (PROGRESS_WIDTH - filled)}] {fraction * 100:5.1f}%"
+
+
+def _show_progress(label, fraction, stream=sys.stderr):
+    stream.write("\r" + _progress_line(label, fraction))
+    if fraction >= 1:
+        stream.write("\n")
+    stream.flush()
+
+
 def _level_bins(level):
     level_db = 20 * np.log10(level)
     return np.clip(
@@ -103,7 +117,7 @@ def _level_bins(level):
         0, LEVEL_HISTOGRAM_BINS - 1)
 
 
-def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False):
+def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
     info = sf.info(path)
     sr = info.samplerate
     _validate_band(sr, fmin, fmax)
@@ -120,9 +134,15 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
     if end_frame - start_frame < N_FFT:
         raise ValueError(f"analysis range must contain at least {N_FFT / sr:.3f} seconds of audio")
     lo, hi = band_bins(sr, fmin, fmax)
+    expected_frames = (end_frame - start_frame - N_FFT) // HOP + 1
+    report_progress = progress or (lambda fraction: _show_progress(f"Analyze {channel}", fraction))
     level_histogram = np.zeros(LEVEL_HISTOGRAM_BINS, np.int64)
     valid_count = 0
+    frame_count = 0
+    report_progress(0.0)
     for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
+        frame_count += len(mag)
+        report_progress(min(frame_count / (expected_frames * 3), 1 / 3))
         level = np.median(mag, axis=1)
         valid = level > 1e-9  # skip digital silence
         valid_count += int(valid.sum())
@@ -143,6 +163,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
     quiet_first = quiet_last = None
     frame_offset = 0
     for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
+        report_progress(min(1 / 3 + (frame_offset + len(mag)) / (expected_frames * 3), 2 / 3))
         level = np.median(mag, axis=1)
         valid = level > 1e-9
         valid_indices = np.flatnonzero(valid)
@@ -172,6 +193,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
     total_frames = 0
     for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
         total_frames += len(mag)
+        report_progress(min(2 / 3 + total_frames / (expected_frames * 3), 1.0))
         if len(peaks):
             audible_counts += np.sum(mag[:, peaks] > 2 * baseline[peaks], axis=0)
     result_peaks = []
@@ -203,6 +225,115 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         "peaks": result_peaks,
     }
     return res
+
+
+def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0,
+                      start=0.0, end=None, x_resolution=1.0, y_resolution=1.0,
+                      progress=None):
+    info = sf.info(path)
+    sr = info.samplerate
+    _validate_band(sr, fmin, fmax)
+    duration = info.frames / sr
+    start = 0.0 if start is None else start
+    end = duration if end is None else end
+    if (not np.isfinite(start) or not np.isfinite(end) or start < 0 or end <= start
+            or end > duration):
+        raise ValueError("spectrogram range must satisfy 0 <= start < end <= file duration")
+    if (not np.isfinite(x_resolution) or x_resolution <= 0
+            or not np.isfinite(y_resolution) or y_resolution <= 0):
+        raise ValueError("spectrogram resolutions must be positive finite numbers")
+    start_frame, end_frame = round(start * sr), round(end * sr)
+    if end_frame - start_frame < N_FFT:
+        raise ValueError(f"spectrogram range must contain at least {N_FFT / sr:.3f} seconds of audio")
+    plot_duration = (end_frame - start_frame) / sr
+    raw_width = plot_duration * 10 * x_resolution
+    raw_height = (fmax - fmin) * y_resolution
+    if (not np.isfinite(raw_width) or not np.isfinite(raw_height)
+            or raw_width * raw_height > 100_000_000):
+        raise ValueError("spectrogram resolution creates an image larger than 100 million pixels")
+    width = max(1, int(np.ceil(raw_width)))
+    height = max(1, int(np.ceil(raw_height)))
+    if width * height > 100_000_000:
+        raise ValueError("spectrogram resolution creates an image larger than 100 million pixels")
+    lo, hi = band_bins(sr, fmin, fmax)
+    bin_freqs = np.arange(lo, hi) * sr / N_FFT
+    plot_freqs = fmin + (np.arange(height) + 0.5) * (fmax - fmin) / height
+    expected_frames = max(1, (end_frame - start_frame - N_FFT) // HOP + 1)
+    report_progress = progress or (lambda fraction: _show_progress(f"Spectrogram {channel}", fraction))
+
+    anchors = np.asarray([[8, 20, 38], [18, 91, 145], [20, 184, 166], [255, 230, 109]], np.float32)
+    palette = []
+    for index in range(64):
+        position = index / 63 * (len(anchors) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(anchors) - 1)
+        rgb = np.rint(anchors[lower] + (anchors[upper] - anchors[lower]) * (position - lower)).astype(int)
+        palette.append("#" + "".join(f"{value:02x}" for value in rgb))
+
+    margin_left, margin_top, margin_right, margin_bottom = 70, 20, 20, 55
+    svg_width = width + margin_left + margin_right
+    svg_height = height + margin_top + margin_bottom
+    with open(output_path, "x", encoding="utf-8") as svg:
+        svg.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}" '
+                  f'viewBox="0 0 {svg_width} {svg_height}">\n')
+        svg.write(f'<rect width="{svg_width}" height="{svg_height}" fill="{palette[0]}"/>\n')
+        svg.write(f'<text x="{margin_left}" y="14" fill="white">Spectrogram: {channel}</text>\n')
+        svg.write(f'<g transform="translate({margin_left},{margin_top})">\n')
+        current_column = None
+        column_values = np.zeros(height, np.float32)
+        frame_offset = 0
+
+        def flush_column():
+            if current_column is None or not np.any(column_values):
+                return
+            colors = np.clip(((20 * np.log10(column_values + 1e-12) + 100) * 63 / 100).astype(int), 0, 63)
+            colors = colors[::-1]
+            runs = {}
+            y = 0
+            while y < height:
+                color = colors[y]
+                end_y = y + 1
+                while end_y < height and colors[end_y] == color:
+                    end_y += 1
+                runs.setdefault(color, []).append(f"M{current_column} {y}h1v{end_y-y}h-1z")
+                y = end_y
+            for color, commands in runs.items():
+                svg.write(f'<path fill="{palette[color]}" d="{"".join(commands)}"/>\n')
+
+        total_frames = 0
+        report_progress(0.0)
+        for mags in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
+            for mag in mags:
+                x = min(width - 1, int(((frame_offset * HOP + N_FFT / 2) / sr) * 10 * x_resolution))
+                if current_column is None:
+                    current_column = x
+                elif x != current_column:
+                    flush_column()
+                    column_values.fill(0)
+                    current_column = x
+                interpolated = np.interp(plot_freqs, bin_freqs, mag, left=0, right=0)
+                np.maximum(column_values, interpolated, out=column_values)
+                frame_offset += 1
+                total_frames += 1
+            report_progress(min(total_frames / expected_frames, 1.0))
+        flush_column()
+        svg.write("</g>\n")
+        start_s, end_s = start_frame / sr, end_frame / sr
+        svg.write(f'<text x="{margin_left + width / 2}" y="{svg_height - 10}" fill="white" '
+                  f'text-anchor="middle">Time (s), {start_s:.3f}-{end_s:.3f}</text>\n')
+        svg.write(f'<text x="14" y="{margin_top + height / 2}" fill="white" '
+                  f'transform="rotate(-90 14 {margin_top + height / 2})" text-anchor="middle">'
+                  f'Frequency (Hz), {fmin:g}-{fmax:g}</text>\n')
+        svg.write(f'<g fill="white" font-size="10">')
+        for tick in range(6):
+            x = margin_left + width * tick / 5
+            seconds = start_s + plot_duration * tick / 5
+            svg.write(f'<text x="{x:.1f}" y="{svg_height-30}" text-anchor="middle">{seconds:.1f}</text>')
+            y = margin_top + height * tick / 5
+            frequency = fmax - (fmax - fmin) * tick / 5
+            svg.write(f'<text x="{margin_left-5}" y="{y:.1f}" text-anchor="end">{frequency:.0f}</text>')
+        svg.write("</g>\n</svg>\n")
+    return output_path
 
 
 def print_stats(res, out=print):
@@ -299,16 +430,17 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
             if e is not None and e.shape[1]:
                 out.write(e.T if subtype in ("FLOAT", "DOUBLE") else np.clip(e.T, -1.0, 1.0))
                 done += e.shape[1]
+                log("\r" + _progress_line("Remove", done / max(total, 1)), end="", flush=True)
 
+        log("\r" + _progress_line("Remove", 0.0), end="", flush=True)
         for blk in _read_chunks(src):
             buf = np.concatenate([buf, blk], axis=1)
             buf, e = run(buf)
             write(e)
-            log(f"\r  {100 * done / max(total, 1):5.1f} %", end="", flush=True)
         buf = np.concatenate([buf, np.zeros((nch, N_FFT + HOP), np.float32)], axis=1)
         buf, e = run(buf)
         write(e)
-        log("\r  100.0 %")
+        log("")
 
 
 def make_output_path(src):
@@ -372,6 +504,12 @@ def main(argv=None):
     ap.add_argument("--max-peaks", type=int, default=12)
     ap.add_argument("--start", type=parse_time, help="analyze from this time (seconds, MM:SS, or HH:MM:SS)")
     ap.add_argument("--end", type=parse_time, help="analyze until this time (seconds, MM:SS, or HH:MM:SS)")
+    ap.add_argument("--spectrogram", nargs="?", const="", metavar="SVG",
+                    help="write a frequency-over-time SVG (default filename generated automatically)")
+    ap.add_argument("--x-resolution", type=float, default=1.0,
+                    help="spectrogram pixels per 0.1 seconds (default: 1)")
+    ap.add_argument("--y-resolution", type=float, default=1.0,
+                    help="spectrogram pixels per Hz (default: 1)")
     ap.add_argument("--hum-only", action="store_true",
                     help="use all non-silent frames in the selected interval as the hum reference")
     ap.add_argument("--save-profile", help="analyze: write identified hum profile to this JSON file")
@@ -394,6 +532,8 @@ def main(argv=None):
         ap.error("--mask-db must be nonnegative")
     if a.max_reduction_db < 0:
         ap.error("--max-reduction-db must be nonnegative")
+    if a.spectrogram is not None and a.mode != "analyze":
+        ap.error("--spectrogram is only available in analyze mode")
     if a.mode == "remove" and a.profile:
         with open(a.profile) as f:
             res = json.load(f)
@@ -414,6 +554,22 @@ def main(argv=None):
                                  hum_only=a.hum_only)
                 results[channel] = result
                 print_stats(result)
+                if a.spectrogram is not None:
+                    if a.spectrogram:
+                        requested = os.path.splitext(a.spectrogram)
+                        output_path = (f"{requested[0]}-{channel}{requested[1] or '.svg'}"
+                                       if len(channels) > 1 else f"{requested[0]}{requested[1] or '.svg'}")
+                    else:
+                        stem, _ = os.path.splitext(a.input)
+                        output_path = f"{stem}-spectrogram-{channel}-{secrets.token_hex(4)}.svg"
+                    if os.path.realpath(output_path) == os.path.realpath(a.input):
+                        ap.error("spectrogram output must not resolve to the input file")
+                    try:
+                        write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
+                                          a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
+                    except (ValueError, FileExistsError) as e:
+                        ap.error(str(e))
+                    print(f"Spectrogram written to {output_path}")
         except ValueError as e:
             ap.error(str(e))
         res = results.get("mix", next(iter(results.values())))

@@ -1,4 +1,5 @@
 import argparse
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
@@ -76,6 +77,52 @@ def test_cli_analyze_defaults_to_all_channels_and_hum_only(tmp_path, capsys):
         assert "hum-only reference:" in output
 
 
+def test_analyze_progress_reaches_completion(tmp_path):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    updates = []
+    hr.analyze(p, progress=updates.append)
+    assert updates[0] == 0
+    assert updates[-1] == 1
+    assert updates == sorted(updates)
+
+
+def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):
+    p = str(tmp_path / "a.wav")
+    out = str(tmp_path / "chart.svg")
+    make(p, seconds=4)
+    hr.write_spectrogram(p, out, fmin=1500, fmax=2000, start=1, end=3,
+                         x_resolution=2, y_resolution=1)
+    root = ET.parse(out).getroot()
+    assert root.attrib["width"] == "130"
+    assert root.attrib["height"] == "575"
+    text = "".join(root.itertext())
+    assert "1500-2000" in text
+    assert "1.0" in text and "3.0" in text
+
+
+@pytest.mark.parametrize("x_resolution,y_resolution", [
+    (0, 1), (1, -1), (float("inf"), 1), (1e9, 1),
+])
+def test_spectrogram_rejects_invalid_resolution(tmp_path, x_resolution, y_resolution):
+    p = str(tmp_path / "a.wav")
+    out = str(tmp_path / "chart.svg")
+    make(p, seconds=2)
+    with pytest.raises(ValueError, match="resolution"):
+        hr.write_spectrogram(p, out, x_resolution=x_resolution, y_resolution=y_resolution)
+    assert not (tmp_path / "chart.svg").exists()
+
+
+def test_cli_generates_spectrogram_for_all_channels(tmp_path, capsys):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    assert hr.main(["analyze", p, "--spectrogram"]) == 0
+    output = capsys.readouterr().out
+    for channel in ("mix", "left", "right"):
+        assert f"analysed channel: {channel}" in output
+        assert list(tmp_path.glob(f"a-spectrogram-{channel}-*.svg"))
+
+
 @pytest.mark.parametrize("value,expected", [
     ("35:10", 2110),
     ("1:02:03.5", 3723.5),
@@ -106,8 +153,10 @@ def test_remove_quiet_part_and_no_overwrite(tmp_path):
     before = open(p, "rb").read()
     res = hr.analyze(p)
     path, fh = hr.open_new_output(p)
+    progress = []
     with fh:
-        hr.remove_hum(p, fh, res, mask_db=6.0, log=lambda *a, **k: None)
+        hr.remove_hum(p, fh, res, mask_db=6.0, log=lambda *a, **k: progress.append(a[0]))
+    assert any("Remove [" in line for line in progress)
     assert path != p and "-nohum-" in path
     assert open(p, "rb").read() == before
     x, _ = sf.read(p)
