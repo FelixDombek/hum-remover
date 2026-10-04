@@ -24,11 +24,12 @@ interval contains only hum to use all its non-silent frames as the reference rat
 frames. When analyzing all channels, `--save-profile` saves the mix result; use `--channel` to save another
 channel's profile. All three channel analyses share each streaming pass; three passes are used to find quiet-frame
 thresholds, build profiles, and measure audibility without retaining the recording in memory.
-Both modes show a progress bar. `--spectrogram` writes a frequency-over-time SVG for each analyzed channel, limited
-to the selected time and frequency ranges. Its defaults are 1 horizontal pixel per 0.1 seconds and 1 vertical pixel
-per Hz; adjust them with `--x-resolution` and `--y-resolution`. If no SVG filename is given, unique files are created
-next to the input. Creating each channel's spectrogram requires an additional streaming FFT pass over the selected
-audio range. Color indicates magnitude from -100 to 0 dBFS; brighter colors indicate stronger frequencies.
+Both modes show a progress bar. `--spectrogram` writes a frequency-over-time SVG with a compressed raster plot for
+each analyzed channel, limited to the selected time and frequency ranges. Its defaults are 1 horizontal pixel per
+0.1 seconds and 1 vertical pixel per Hz; adjust them with `--x-resolution` and `--y-resolution`. Images are capped
+at 100 million pixels. If no SVG filename is given, unique files are created next to the input. Creating each
+channel's spectrogram requires an additional streaming FFT pass over the selected audio range. Color indicates
+magnitude from -100 to 0 dBFS; brighter colors indicate stronger frequencies.
 `remove` writes `concert-nohum-<random>.wav` next to the input; existing files (including the input) are never
 overwritten.
 

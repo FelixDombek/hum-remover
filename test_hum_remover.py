@@ -1,4 +1,6 @@
 import argparse
+import base64
+import struct
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -127,7 +129,11 @@ def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):
     text = "".join(root.itertext())
     assert "1500-2000" in text
     assert "1.0" in text and "3.0" in text
-    assert root.findall(".//{http://www.w3.org/2000/svg}path")
+    image = root.find(".//{http://www.w3.org/2000/svg}image")
+    assert image is not None
+    png = base64.b64decode(image.attrib["href"].split(",", 1)[1])
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert struct.unpack(">II", png[16:24]) == (40, 500)
 
 
 @pytest.mark.parametrize("x_resolution,y_resolution", [
@@ -183,6 +189,18 @@ def test_cli_generates_spectrogram_for_all_channels(tmp_path, capsys):
     for channel in ("mix", "left", "right"):
         assert f"analysed channel: {channel}" in output
         assert list(tmp_path.glob(f"a-spectrogram-{channel}-*.svg"))
+
+
+def test_cli_validates_spectrogram_before_analysis(tmp_path, monkeypatch):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+
+    def unexpected_analysis(*args, **kwargs):
+        raise AssertionError("analysis must not run for invalid chart options")
+
+    monkeypatch.setattr(hr, "analyze_channels", unexpected_analysis)
+    with pytest.raises(SystemExit):
+        hr.main(["analyze", p, "--spectrogram", "--x-resolution", "0"])
 
 
 @pytest.mark.parametrize("value,expected", [

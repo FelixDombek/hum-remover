@@ -14,12 +14,16 @@ Algorithm (all streaming, so a 1 h / 700 MB file needs little RAM):
     background below hum -> 100 % removed, background >= hum + mask_db -> 0 % removed, linear in dB between.
 """
 import argparse
+import base64
 import json
 import os
 import secrets
+import struct
 import sys
 from contextlib import contextmanager
+from tempfile import SpooledTemporaryFile
 from xml.sax.saxutils import escape
+import zlib
 
 import numpy as np
 import scipy.fft
@@ -40,6 +44,7 @@ SPECTROGRAM_PALETTE_SIZE = 64
 SPECTROGRAM_DB_FLOOR = -100.0
 SPECTROGRAM_DB_CEILING = 0.0
 SPECTROGRAM_AMP_FLOOR = 1e-12
+SPECTROGRAM_MAX_PIXELS = 100_000_000
 WINDOW = np.sqrt(scipy.signal.get_window("hann", N_FFT, fftbins=True))
 WIN_NORM = float(np.sum(WINDOW**2) / HOP)  # sqrt-hann analysis+synthesis OLA gain compensation
 WIN_SUM = float(np.sum(WINDOW)) / 2  # amplitude normalisation so a unit sine gives magnitude ~1
@@ -149,17 +154,73 @@ def _spectrogram_palette():
 @contextmanager
 def _exclusive_text_output(path):
     output = open(path, "x", encoding="utf-8")
+    failed = False
     try:
         yield output
     except BaseException:
-        output.close()
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        failed = True
         raise
     finally:
-        output.close()
+        try:
+            output.close()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if failed:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def _write_png_chunk(output, chunk_type, data):
+    output.write(struct.pack(">I", len(data)))
+    output.write(chunk_type)
+    output.write(data)
+    crc = zlib.crc32(data, zlib.crc32(chunk_type))
+    output.write(struct.pack(">I", crc & 0xffffffff))
+
+
+def _write_embedded_png(svg, pixels, palette):
+    height, width = pixels.shape
+    png = SpooledTemporaryFile(max_size=1 << 20)
+    compressed = SpooledTemporaryFile(max_size=1 << 20)
+    try:
+        compressor = zlib.compressobj()
+        for row in pixels:
+            compressed.write(compressor.compress(b"\0" + row.tobytes()))
+        compressed.write(compressor.flush())
+        compressed_length = compressed.tell()
+        png.write(b"\x89PNG\r\n\x1a\n")
+        _write_png_chunk(png, b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 3, 0, 0, 0))
+        color_table = bytes(int(color[index:index + 2], 16)
+                            for color in palette for index in (1, 3, 5))
+        _write_png_chunk(png, b"PLTE", color_table)
+        png.write(struct.pack(">I", compressed_length))
+        png.write(b"IDAT")
+        crc = zlib.crc32(b"IDAT")
+        compressed.seek(0)
+        while data := compressed.read(1 << 16):
+            png.write(data)
+            crc = zlib.crc32(data, crc)
+        png.write(struct.pack(">I", crc & 0xffffffff))
+        _write_png_chunk(png, b"IEND", b"")
+        png.seek(0)
+        svg.write(f'<image width="{width}" height="{height}" '
+                  f'href="data:image/png;base64,')
+        remainder = b""
+        while data := png.read(1 << 16):
+            data = remainder + data
+            encoded_size = len(data) - len(data) % 3
+            svg.write(base64.b64encode(data[:encoded_size]).decode("ascii"))
+            remainder = data[encoded_size:]
+        if remainder:
+            svg.write(base64.b64encode(remainder).decode("ascii"))
+        svg.write('"/>\n')
+    finally:
+        compressed.close()
+        png.close()
 
 
 def _level_bins(level):
@@ -170,7 +231,7 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
-    """Analyze one channel; `log` is retained for compatibility and deprecated in favor of `progress`."""
+    """Analyze one channel; `log` is ignored and retained for compatibility, use `progress` instead."""
     return analyze_channels(
         path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
         start=start, end=end, hum_only=hum_only, progress=progress)[channel]
@@ -180,6 +241,10 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
                      min_prominence_db=6.0, max_peaks=12,
                      channels=("mix", "left", "right"), start=0.0, end=None,
                      hum_only=False, progress=None):
+    """Analyze channels together in three streaming passes and return results keyed by channel.
+
+    Progress fractions advance through level histograms, quiet-frame profiles, and audibility counts.
+    """
     channels = tuple(dict.fromkeys(channels))
     if not channels or any(channel not in ("left", "right", "mix") for channel in channels):
         raise ValueError("channels must be selected from left, right, and mix")
@@ -316,10 +381,7 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
     return results
 
 
-def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0,
-                      start=0.0, end=None, x_resolution=1.0, y_resolution=1.0,
-                      progress=None):
-    info = sf.info(path)
+def _spectrogram_geometry(info, fmin, fmax, start, end, x_resolution, y_resolution):
     sr = info.samplerate
     _validate_band(sr, fmin, fmax)
     duration = info.frames / sr
@@ -337,13 +399,23 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
     plot_duration = (end_frame - start_frame) / sr
     raw_width = plot_duration * 10 * x_resolution
     raw_height = (fmax - fmin) * y_resolution
-    if (not np.isfinite(raw_width) or not np.isfinite(raw_height)
-            or raw_width * raw_height > 100_000_000):
-        raise ValueError("spectrogram resolution creates an image larger than 100 million pixels")
+    if not np.isfinite(raw_width) or not np.isfinite(raw_height):
+        raise ValueError("spectrogram resolution must produce finite dimensions")
     width = max(1, int(np.ceil(raw_width)))
     height = max(1, int(np.ceil(raw_height)))
-    if width * height > 100_000_000:
-        raise ValueError("spectrogram resolution creates an image larger than 100 million pixels")
+    if width * height > SPECTROGRAM_MAX_PIXELS:
+        raise ValueError(
+            f"spectrogram resolution exceeds the {SPECTROGRAM_MAX_PIXELS:,}-pixel limit")
+    return start_frame, end_frame, plot_duration, width, height
+
+
+def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0,
+                      start=0.0, end=None, x_resolution=1.0, y_resolution=1.0,
+                      progress=None):
+    info = sf.info(path)
+    sr = info.samplerate
+    start_frame, end_frame, plot_duration, width, height = _spectrogram_geometry(
+        info, fmin, fmax, start, end, x_resolution, y_resolution)
     lo, hi = band_bins(sr, fmin, fmax)
     bin_freqs = np.arange(lo, hi) * sr / N_FFT
     plot_freqs = fmin + (np.arange(height) + 0.5) * (fmax - fmin) / height
@@ -359,6 +431,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
     margin_left, margin_top, margin_right, margin_bottom = 70, 20, 20, 55
     svg_width = width + margin_left + margin_right
     svg_height = height + margin_top + margin_bottom
+    pixels = np.zeros((height, width), np.uint8)
     with _exclusive_text_output(output_path) as svg:
         svg.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}" '
                   f'viewBox="0 0 {svg_width} {svg_height}">\n')
@@ -379,16 +452,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
                  * (SPECTROGRAM_PALETTE_SIZE - 1)
                  / (SPECTROGRAM_DB_CEILING - SPECTROGRAM_DB_FLOOR)).astype(int),
                 0, SPECTROGRAM_PALETTE_SIZE - 1)
-            colors = colors[::-1]
-            boundaries = np.r_[0, np.flatnonzero(np.diff(colors)) + 1, height]
-            run_starts, run_lengths = boundaries[:-1], np.diff(boundaries)
-            run_colors = colors[run_starts]
-            for color in np.unique(run_colors):
-                selected = run_colors == color
-                commands = "".join(
-                    f"M{current_column} {y}h1v{length}h-1z"
-                    for y, length in zip(run_starts[selected], run_lengths[selected]))
-                svg.write(f'<path fill="{palette[color]}" d="{commands}"/>\n')
+            pixels[:, current_column] = colors[::-1].astype(np.uint8)
 
         total_frames = 0
         report_progress(0.0)
@@ -413,6 +477,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
             total_frames += len(mags)
             report_progress(min(total_frames / expected_frames, 1.0))
         flush_column()
+        _write_embedded_png(svg, pixels, palette)
         svg.write("</g>\n")
         start_s, end_s = start_frame / sr, end_frame / sr
         svg.write(f'<text x="{margin_left + width / 2}" y="{svg_height - 10}" fill="white" '
@@ -648,6 +713,24 @@ def main(argv=None):
         ap.error("--max-reduction-db must be nonnegative")
     if a.spectrogram is not None and a.mode != "analyze":
         ap.error("--spectrogram is only available in analyze mode")
+    channels = ([a.channel] if a.channel else
+                ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
+    spectrogram_paths = {}
+    if a.spectrogram is not None:
+        try:
+            _spectrogram_geometry(
+                sf.info(a.input), a.fmin, a.fmax, a.start or 0.0, a.end,
+                a.x_resolution, a.y_resolution)
+            for channel in channels:
+                output_path = _spectrogram_output_path(
+                    a.input, a.spectrogram, channel, len(channels) > 1)
+                if os.path.lexists(output_path):
+                    raise FileExistsError(f"spectrogram output already exists: {output_path}")
+                if a.save_profile and os.path.realpath(a.save_profile) == os.path.realpath(output_path):
+                    raise ValueError("profile and spectrogram outputs must use different paths")
+                spectrogram_paths[channel] = output_path
+        except (ValueError, FileExistsError) as e:
+            ap.error(str(e))
     if a.mode == "remove" and a.profile:
         with open(a.profile) as f:
             res = json.load(f)
@@ -658,8 +741,6 @@ def main(argv=None):
         print_stats(res)
     else:
         print("Analyzing...")
-        channels = ([a.channel] if a.channel else
-                    ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
         try:
             results = analyze_channels(
                 a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db,
@@ -670,8 +751,7 @@ def main(argv=None):
                 print_stats(result)
                 if a.spectrogram is not None:
                     try:
-                        output_path = _spectrogram_output_path(
-                            a.input, a.spectrogram, channel, len(channels) > 1)
+                        output_path = spectrogram_paths[channel]
                         write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
                     except (ValueError, FileExistsError) as e:
