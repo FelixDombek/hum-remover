@@ -2,6 +2,7 @@ import argparse
 import base64
 import struct
 import xml.etree.ElementTree as ET
+import zlib
 
 import numpy as np
 import pytest
@@ -117,6 +118,13 @@ def test_analyze_progress_reaches_completion(tmp_path):
     assert updates == sorted(updates)
 
 
+def test_analyze_log_argument_warns_that_it_is_ignored(tmp_path):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    with pytest.warns(DeprecationWarning, match=r"log=\.\.\.\) is ignored"):
+        hr.analyze(p, log=lambda *args: None, progress=lambda _: None)
+
+
 def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):
     p = str(tmp_path / "a.wav")
     out = str(tmp_path / "chart.svg")
@@ -134,6 +142,50 @@ def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):
     png = base64.b64decode(image.attrib["href"].split(",", 1)[1])
     assert png.startswith(b"\x89PNG\r\n\x1a\n")
     assert struct.unpack(">II", png[16:24]) == (40, 500)
+
+
+def test_spectrogram_accepts_falsy_progress_callback(tmp_path):
+    class FalsyProgress:
+        def __init__(self):
+            self.values = []
+
+        def __bool__(self):
+            return False
+
+        def __call__(self, value):
+            self.values.append(value)
+
+    p = str(tmp_path / "a.wav")
+    out = str(tmp_path / "chart.svg")
+    make(p, seconds=2)
+    progress = FalsyProgress()
+    hr.write_spectrogram(p, out, progress=progress)
+    assert progress.values[0] == 0
+    assert progress.values[-1] == 1
+
+
+def test_spectrogram_forward_fills_columns_without_frames(tmp_path):
+    p = str(tmp_path / "tone.wav")
+    out = str(tmp_path / "chart.svg")
+    t = np.arange(SR * 2) / SR
+    sf.write(p, 0.1 * np.sin(2 * np.pi * 1800 * t), SR, subtype="FLOAT")
+    hr.write_spectrogram(p, out, fmin=1500, fmax=2100, x_resolution=20)
+    root = ET.parse(out).getroot()
+    png = base64.b64decode(root.find(".//{http://www.w3.org/2000/svg}image").attrib["href"].split(",", 1)[1])
+    width, height = struct.unpack(">II", png[16:24])
+    offset, compressed = 8, bytearray()
+    while offset < len(png):
+        size = struct.unpack(">I", png[offset:offset + 4])[0]
+        chunk_type = png[offset + 4:offset + 8]
+        if chunk_type == b"IDAT":
+            compressed.extend(png[offset + 8:offset + 8 + size])
+        offset += size + 12
+    rows = np.frombuffer(zlib.decompress(compressed), np.uint8).reshape(height, width + 1)
+    pixels = rows[:, 1:]
+    nframes = (SR * 2 - hr.N_FFT) // hr.HOP + 1
+    frame_columns = ((np.arange(nframes) * hr.HOP + hr.N_FFT / 2) / SR * 200).astype(int)
+    gap = next(right - 1 for left, right in zip(frame_columns, frame_columns[1:]) if right > left + 1)
+    assert np.array_equal(pixels[:, gap], pixels[:, gap - 1])
 
 
 @pytest.mark.parametrize("x_resolution,y_resolution", [
@@ -201,6 +253,21 @@ def test_cli_validates_spectrogram_before_analysis(tmp_path, monkeypatch):
     monkeypatch.setattr(hr, "analyze_channels", unexpected_analysis)
     with pytest.raises(SystemExit):
         hr.main(["analyze", p, "--spectrogram", "--x-resolution", "0"])
+
+
+def test_cli_continues_other_spectrograms_after_one_fails(tmp_path, monkeypatch, capsys):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    channels = []
+
+    def fail_chart(path, output, channel, *args, **kwargs):
+        channels.append(channel)
+        raise FileExistsError("output appeared during analysis")
+
+    monkeypatch.setattr(hr, "write_spectrogram", fail_chart)
+    assert hr.main(["analyze", p, "--spectrogram"]) == 0
+    assert channels == ["mix", "left", "right"]
+    assert capsys.readouterr().err.count("Spectrogram for") == 3
 
 
 @pytest.mark.parametrize("value,expected", [

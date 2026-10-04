@@ -20,6 +20,7 @@ import os
 import secrets
 import struct
 import sys
+import warnings
 from contextlib import contextmanager
 from tempfile import SpooledTemporaryFile
 from xml.sax.saxutils import escape
@@ -44,7 +45,7 @@ SPECTROGRAM_PALETTE_SIZE = 64
 SPECTROGRAM_DB_FLOOR = -100.0
 SPECTROGRAM_DB_CEILING = 0.0
 SPECTROGRAM_AMP_FLOOR = 1e-12
-SPECTROGRAM_MAX_PIXELS = 100_000_000
+SPECTROGRAM_MAX_PIXELS = 64_000_000
 WINDOW = np.sqrt(scipy.signal.get_window("hann", N_FFT, fftbins=True))
 WIN_NORM = float(np.sum(WINDOW**2) / HOP)  # sqrt-hann analysis+synthesis OLA gain compensation
 WIN_SUM = float(np.sum(WINDOW)) / 2  # amplitude normalisation so a unit sine gives magnitude ~1
@@ -231,7 +232,10 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
-    """Analyze one channel; `log` is ignored and retained for compatibility, use `progress` instead."""
+    """Analyze one channel; `log` is ignored and deprecated, use `progress` instead."""
+    if log is not print:
+        warnings.warn("analyze(log=...) is ignored; use progress=... instead",
+                      DeprecationWarning, stacklevel=2)
     return analyze_channels(
         path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
         start=start, end=end, hum_only=hum_only, progress=progress)[channel]
@@ -425,7 +429,9 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
                      / (bin_freqs[right_bins] - bin_freqs[left_bins]))
     in_band = (plot_freqs >= bin_freqs[0]) & (plot_freqs <= bin_freqs[-1])
     expected_frames = max(1, (end_frame - start_frame - N_FFT) // HOP + 1)
-    report_progress = _progress_reporter(progress or (lambda fraction: _show_progress(f"Spectrogram {channel}", fraction)))
+    report_progress = _progress_reporter(
+        progress if progress is not None else
+        lambda fraction: _show_progress(f"Spectrogram {channel}", fraction))
     palette = _spectrogram_palette()
 
     margin_left, margin_top, margin_right, margin_bottom = 70, 20, 20, 55
@@ -468,6 +474,8 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
                     current_column = x
                 elif x != current_column:
                     flush_column()
+                    if x > current_column + 1:
+                        pixels[:, current_column + 1:x] = pixels[:, current_column, None]
                     column_values.fill(0)
                     current_column = x
                 values = spectrum[left_bins] * (1 - interpolation) + spectrum[right_bins] * interpolation
@@ -754,8 +762,9 @@ def main(argv=None):
                         output_path = spectrogram_paths[channel]
                         write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
-                    except (ValueError, FileExistsError) as e:
-                        ap.error(str(e))
+                    except (OSError, ValueError) as e:
+                        print(f"Spectrogram for {channel} failed: {e}", file=sys.stderr)
+                        continue
                     print(f"Spectrogram written to {output_path}")
         except ValueError as e:
             ap.error(str(e))
