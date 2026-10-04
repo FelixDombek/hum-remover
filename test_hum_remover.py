@@ -53,6 +53,29 @@ def test_analyze_time_range_detects_only_selected_segment(tmp_path):
     assert res["quiet_first_s"] >= 2
 
 
+def test_hum_only_uses_all_non_silent_frames(tmp_path):
+    p = str(tmp_path / "varying-hum.wav")
+    t = np.arange(SR * 4) / SR
+    amplitude = np.where(t < 2, 0.001, 0.02)
+    sf.write(p, amplitude * np.sin(2 * np.pi * 1800 * t), SR, subtype="FLOAT")
+
+    quiet = hr.analyze(p, start=0, end=4)
+    hum_only = hr.analyze(p, start=0, end=4, hum_only=True)
+    assert quiet["reference_mode"] == "quietest"
+    assert hum_only["reference_mode"] == "hum-only"
+    assert hum_only["quiet_frames"] > quiet["quiet_frames"]
+
+
+def test_cli_analyze_defaults_to_all_channels_and_hum_only(tmp_path, capsys):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    assert hr.main(["analyze", p, "--hum-only"]) == 0
+    output = capsys.readouterr().out
+    for channel in ("mix", "left", "right"):
+        assert f"analysed channel: {channel}" in output
+        assert "hum-only reference:" in output
+
+
 @pytest.mark.parametrize("value,expected", [
     ("35:10", 2110),
     ("1:02:03.5", 3723.5),

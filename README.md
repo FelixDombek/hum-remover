@@ -13,10 +13,15 @@ processed in chunks without loading it into RAM).
 python hum_remover.py analyze concert.wav            # print statistics about the hum
 python hum_remover.py analyze concert.wav --save-profile hum.json
 python hum_remover.py analyze concert.wav --start "35:10" --end "35:12"
+python hum_remover.py analyze concert.wav --start "35:10" --end "35:12" --hum-only
 python hum_remover.py remove  concert.wav [--profile hum.json] [--mask-db 12] [--max-reduction-db 30]
 ```
 `analyze` accepts optional `--start` and `--end` bounds in seconds, `MM:SS`, or `HH:MM:SS` format. Omit either
-bound to analyze from the beginning or through the end of the file, respectively.
+bound to analyze from the beginning or through the end of the file, respectively. By default, `analyze` reports
+mix, left, and right results; `--channel` selects a single channel instead. Use `--hum-only` when the selected
+interval contains only hum to use all its non-silent frames as the reference rather than selecting the quietest
+frames. When analyzing all channels, `--save-profile` saves the mix result; use `--channel` to save another
+channel's profile.
 `remove` writes `concert-nohum-<random>.wav` next to the input; existing files (including the input) are never
 overwritten.
 

@@ -103,7 +103,7 @@ def _level_bins(level):
         0, LEVEL_HISTOGRAM_BINS - 1)
 
 
-def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None):
+def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False):
     info = sf.info(path)
     sr = info.samplerate
     _validate_band(sr, fmin, fmax)
@@ -126,14 +126,17 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         level = np.median(mag, axis=1)
         valid = level > 1e-9  # skip digital silence
         valid_count += int(valid.sum())
-        if valid.any():
+        if valid.any() and not hum_only:
             level_histogram += np.bincount(_level_bins(level[valid]), minlength=LEVEL_HISTOGRAM_BINS)
     if valid_count == 0:
         raise ValueError("file too short to analyze")
     if valid_count < 4:
         raise ValueError("file is (nearly) digital silence")
-    n_quiet = max(3, int(valid_count * quiet_percent / 100))
-    threshold_bin = np.searchsorted(np.cumsum(level_histogram), n_quiet)
+    if hum_only:
+        threshold_bin = LEVEL_HISTOGRAM_BINS - 1
+    else:
+        n_quiet = max(3, int(valid_count * quiet_percent / 100))
+        threshold_bin = np.searchsorted(np.cumsum(level_histogram), n_quiet)
     rng = np.random.default_rng(0)
     quiet_sample = []
     quiet_count = 0
@@ -143,7 +146,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         level = np.median(mag, axis=1)
         valid = level > 1e-9
         valid_indices = np.flatnonzero(valid)
-        quiet = valid_indices[_level_bins(level[valid]) <= threshold_bin]
+        quiet = valid_indices if hum_only else valid_indices[_level_bins(level[valid]) <= threshold_bin]
         for i in quiet:
             frame_time = (start_frame + (frame_offset + int(i)) * HOP) / sr
             if quiet_first is None:
@@ -194,6 +197,7 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         "duration_s": duration, "analysis_duration_s": (end_frame - start_frame) / sr,
         "analysis_start_s": start_frame / sr, "analysis_end_s": end_frame / sr,
         "n_fft": N_FFT, "band_hz": [fmin, fmax],
+        "reference_mode": "hum-only" if hum_only else "quietest",
         "quiet_frames": quiet_count, "quiet_total_s": float(quiet_count * HOP / sr),
         "quiet_first_s": float(quiet_first), "quiet_last_s": float(quiet_last),
         "peaks": result_peaks,
@@ -206,9 +210,12 @@ def print_stats(res, out=print):
         f"  [analysed channel: {res.get('channel', 'mix')}]")
     if "analysis_start_s" in res and (res["analysis_start_s"] != 0 or res["analysis_end_s"] != res["duration_s"]):
         out(f"Analyzed interval: {res['analysis_start_s']:.2f}-{res['analysis_end_s']:.2f} s")
-    out(f"Band searched: {res['band_hz'][0]:.0f}-{res['band_hz'][1]:.0f} Hz, "
-        f"quiet reference: {res['quiet_frames']} frames (~{res['quiet_total_s']:.0f} s, "
-        f"between {res['quiet_first_s']:.0f}s and {res['quiet_last_s']:.0f}s)")
+    band = f"Band searched: {res['band_hz'][0]:.0f}-{res['band_hz'][1]:.0f} Hz"
+    if res.get("reference_mode") == "hum-only":
+        out(f"{band}, hum-only reference: {res['quiet_frames']} frames")
+    else:
+        out(f"{band}, quiet reference: {res['quiet_frames']} frames (~{res['quiet_total_s']:.0f} s, "
+            f"between {res['quiet_first_s']:.0f}s and {res['quiet_last_s']:.0f}s)")
     if not res["peaks"]:
         out("No hum peaks found. Try lowering --min-prominence-db or widening --fmin/--fmax.")
         return
@@ -360,12 +367,13 @@ def main(argv=None):
     ap.add_argument("--fmax", type=float, default=3000.0, help="upper edge of hum search band in Hz")
     ap.add_argument("--quiet-percent", type=float, default=10.0, help="%% of quietest frames used as hum reference")
     ap.add_argument("--min-prominence-db", type=float, default=6.0, help="min. peak height over local baseline")
-    ap.add_argument("--channel", choices=["left", "right", "mix"], default="mix",
-                    help="channel used for hum detection and for the audibility/masking decision "
-                         "(removal itself is applied to all channels)")
+    ap.add_argument("--channel", choices=["left", "right", "mix"],
+                    help="channel to analyze; analyze defaults to all channels, remove defaults to mix")
     ap.add_argument("--max-peaks", type=int, default=12)
     ap.add_argument("--start", type=parse_time, help="analyze from this time (seconds, MM:SS, or HH:MM:SS)")
     ap.add_argument("--end", type=parse_time, help="analyze until this time (seconds, MM:SS, or HH:MM:SS)")
+    ap.add_argument("--hum-only", action="store_true",
+                    help="use all non-silent frames in the selected interval as the hum reference")
     ap.add_argument("--save-profile", help="analyze: write identified hum profile to this JSON file")
     ap.add_argument("--profile", help="remove: use this JSON profile instead of analysing the input again")
     ap.add_argument("--mask-db", type=float, default=12.0,
@@ -393,14 +401,22 @@ def main(argv=None):
             validate_profile(res, a.input)
         except ValueError as e:
             ap.error(str(e))
+        print_stats(res)
     else:
         print("Analyzing...")
+        channels = ([a.channel] if a.channel else
+                    ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
+        results = {}
         try:
-            res = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db, a.max_peaks, a.channel,
-                          start=a.start or 0.0, end=a.end)
+            for channel in channels:
+                result = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db,
+                                 a.max_peaks, channel, start=a.start or 0.0, end=a.end,
+                                 hum_only=a.hum_only)
+                results[channel] = result
+                print_stats(result)
         except ValueError as e:
             ap.error(str(e))
-    print_stats(res)
+        res = results.get("mix", next(iter(results.values())))
     if a.save_profile:
         with open(a.save_profile, "w") as f:
             json.dump(res, f, indent=1)
