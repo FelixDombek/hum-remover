@@ -22,7 +22,8 @@ bound to analyze from the beginning or through the end of the file, respectively
 mix, left, and right results; `--channel` selects a single channel instead. Use `--hum-only` when the selected
 interval contains only hum to use all its non-silent frames as the reference rather than selecting the quietest
 frames. When analyzing all channels, `--save-profile` saves the mix result; use `--channel` to save another
-channel's profile.
+channel's profile. All three channel analyses share each streaming pass; three passes are used to find quiet-frame
+thresholds, build profiles, and measure audibility without retaining the recording in memory.
 Both modes show a progress bar. `--spectrogram` writes a frequency-over-time SVG for each analyzed channel, limited
 to the selected time and frequency ranges. Its defaults are 1 horizontal pixel per 0.1 seconds and 1 vertical pixel
 per Hz; adjust them with `--x-resolution` and `--y-resolution`. If no SVG filename is given, unique files are created

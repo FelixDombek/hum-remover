@@ -91,14 +91,19 @@ def _validate_band(sr, fmin, fmax):
 
 
 def _iter_band_mags(path, lo, hi, channel, start_frame=0, end_frame=None):
+    for mags in _iter_band_mags_multi(path, lo, hi, [channel], start_frame, end_frame):
+        yield mags[:, 0, :]
+
+
+def _iter_band_mags_multi(path, lo, hi, channels, start_frame=0, end_frame=None):
     info = sf.info(path)
     buf = np.zeros((info.channels, 0), np.float32)
     for blk in _read_chunks(path, start_frame, end_frame):
         buf = np.concatenate([buf, blk], axis=1)
         fr, used = _frames(buf)
         if used:
-            mono = select_channel(fr, channel)
-            yield (np.abs(scipy.fft.rfft(mono, axis=-1)[:, lo:hi]) / WIN_SUM).astype(np.float32)
+            mono = np.stack([select_channel(fr, channel) for channel in channels], axis=1)
+            yield (np.abs(scipy.fft.rfft(mono, axis=-1)[..., lo:hi]) / WIN_SUM).astype(np.float32)
             buf = buf[:, used:]
 
 
@@ -148,6 +153,18 @@ def _level_bins(level):
 
 
 def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_db=6.0, max_peaks=12, channel="mix", log=print, start=0.0, end=None, hum_only=False, progress=None):
+    return analyze_channels(
+        path, fmin, fmax, quiet_percent, min_prominence_db, max_peaks, [channel],
+        start=start, end=end, hum_only=hum_only, progress=progress)[channel]
+
+
+def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
+                     min_prominence_db=6.0, max_peaks=12,
+                     channels=("mix", "left", "right"), start=0.0, end=None,
+                     hum_only=False, progress=None):
+    channels = tuple(dict.fromkeys(channels))
+    if not channels or any(channel not in ("left", "right", "mix") for channel in channels):
+        raise ValueError("channels must be selected from left, right, and mix")
     info = sf.info(path)
     sr = info.samplerate
     _validate_band(sr, fmin, fmax)
@@ -165,97 +182,120 @@ def analyze(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0, min_prominence_d
         raise ValueError(f"analysis range must contain at least {N_FFT / sr:.3f} seconds of audio")
     lo, hi = band_bins(sr, fmin, fmax)
     expected_frames = (end_frame - start_frame - N_FFT) // HOP + 1
-    report_progress = _progress_reporter(progress or (lambda fraction: _show_progress(f"Analyze {channel}", fraction)))
-    level_histogram = np.zeros(LEVEL_HISTOGRAM_BINS, np.int64)
-    valid_count = 0
+    channel_label = "/".join(channels)
+    report_progress = _progress_reporter(
+        progress if progress is not None else
+        lambda fraction: _show_progress(f"Analyze {channel_label}", fraction))
+    level_histograms = [np.zeros(LEVEL_HISTOGRAM_BINS, np.int64) for _ in channels]
+    valid_counts = np.zeros(len(channels), np.int64)
     frame_count = 0
     report_progress(0.0)
-    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
-        frame_count += len(mag)
+    for mags in _iter_band_mags_multi(path, lo, hi, channels, start_frame, end_frame):
+        frame_count += len(mags)
         report_progress(min(frame_count / (expected_frames * 3), 1 / 3))
-        level = np.median(mag, axis=1)
-        valid = level > 1e-9  # skip digital silence
-        valid_count += int(valid.sum())
-        if valid.any() and not hum_only:
-            level_histogram += np.bincount(_level_bins(level[valid]), minlength=LEVEL_HISTOGRAM_BINS)
-    if valid_count == 0:
-        raise ValueError("file too short to analyze")
-    if valid_count < 4:
-        raise ValueError("file is (nearly) digital silence")
-    if hum_only:
-        threshold_bin = LEVEL_HISTOGRAM_BINS - 1
-    else:
-        n_quiet = max(3, int(valid_count * quiet_percent / 100))
-        threshold_bin = np.searchsorted(np.cumsum(level_histogram), n_quiet)
-    rng = np.random.default_rng(0)
-    quiet_sample = []
-    quiet_count = 0
-    quiet_first = quiet_last = None
+        levels = np.median(mags, axis=2)
+        for index in range(len(channels)):
+            valid = levels[:, index] > 1e-9
+            valid_counts[index] += int(valid.sum())
+            if valid.any() and not hum_only:
+                level_histograms[index] += np.bincount(
+                    _level_bins(levels[valid, index]), minlength=LEVEL_HISTOGRAM_BINS)
+    if np.any(valid_counts == 0):
+        raise ValueError("file too short to analyze one or more selected channels")
+    if np.any(valid_counts < 4):
+        raise ValueError("file is (nearly) digital silence in one or more selected channels")
+    threshold_bins = []
+    for index in range(len(channels)):
+        if hum_only:
+            threshold_bins.append(LEVEL_HISTOGRAM_BINS - 1)
+        else:
+            n_quiet = max(3, int(valid_counts[index] * quiet_percent / 100))
+            threshold_bins.append(np.searchsorted(np.cumsum(level_histograms[index]), n_quiet))
+
+    rngs = [np.random.default_rng(index) for index in range(len(channels))]
+    quiet_samples = [[] for _ in channels]
+    quiet_counts = np.zeros(len(channels), np.int64)
+    quiet_first = [None for _ in channels]
+    quiet_last = [None for _ in channels]
     frame_offset = 0
-    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
-        report_progress(min(1 / 3 + (frame_offset + len(mag)) / (expected_frames * 3), 2 / 3))
-        level = np.median(mag, axis=1)
-        valid = level > 1e-9
-        valid_indices = np.flatnonzero(valid)
-        quiet = valid_indices if hum_only else valid_indices[_level_bins(level[valid]) <= threshold_bin]
-        for i in quiet:
-            frame_time = (start_frame + (frame_offset + int(i)) * HOP) / sr
-            if quiet_first is None:
-                quiet_first = frame_time
-            quiet_last = frame_time
-            quiet_count += 1
-            if len(quiet_sample) < PROFILE_SAMPLE_FRAMES:
-                quiet_sample.append(mag[i].copy())
-            else:
-                replacement = int(rng.integers(quiet_count))
-                if replacement < PROFILE_SAMPLE_FRAMES:
-                    quiet_sample[replacement] = mag[i].copy()
-        frame_offset += len(mag)
-    if not quiet_sample:
-        raise ValueError("file is (nearly) digital silence")
-    profile = np.median(np.asarray(quiet_sample), axis=0)
-    baseline = scipy.ndimage.median_filter(profile, size=NEIGHBOUR_BINS + 1, mode="nearest")
-    ratio_db = 20 * np.log10((profile + 1e-12) / (baseline + 1e-12))
-    peaks, _ = scipy.signal.find_peaks(ratio_db, height=min_prominence_db, distance=2 * PEAK_HALF_WIDTH)
-    peaks = peaks[np.argsort(ratio_db[peaks])[::-1][:max_peaks]]
-    peaks = np.sort(peaks)
-    audible_counts = np.zeros(len(peaks), np.int64)
+    for mags in _iter_band_mags_multi(path, lo, hi, channels, start_frame, end_frame):
+        report_progress(min(1 / 3 + (frame_offset + len(mags)) / (expected_frames * 3), 2 / 3))
+        levels = np.median(mags, axis=2)
+        for index in range(len(channels)):
+            valid_indices = np.flatnonzero(levels[:, index] > 1e-9)
+            quiet = (valid_indices if hum_only else
+                     valid_indices[_level_bins(levels[valid_indices, index]) <= threshold_bins[index]])
+            for i in quiet:
+                frame_time = (start_frame + (frame_offset + int(i)) * HOP) / sr
+                if quiet_first[index] is None:
+                    quiet_first[index] = frame_time
+                quiet_last[index] = frame_time
+                quiet_counts[index] += 1
+                sample = quiet_samples[index]
+                if len(sample) < PROFILE_SAMPLE_FRAMES:
+                    sample.append(mags[i, index].copy())
+                else:
+                    replacement = int(rngs[index].integers(quiet_counts[index]))
+                    if replacement < PROFILE_SAMPLE_FRAMES:
+                        sample[replacement] = mags[i, index].copy()
+        frame_offset += len(mags)
+    profiles, baselines, ratios, peaks_by_channel = [], [], [], []
+    for sample in quiet_samples:
+        if not sample:
+            raise ValueError("file is (nearly) digital silence")
+        profile = np.median(np.asarray(sample), axis=0)
+        baseline = scipy.ndimage.median_filter(profile, size=NEIGHBOUR_BINS + 1, mode="nearest")
+        ratio_db = 20 * np.log10((profile + 1e-12) / (baseline + 1e-12))
+        peaks, _ = scipy.signal.find_peaks(
+            ratio_db, height=min_prominence_db, distance=2 * PEAK_HALF_WIDTH)
+        peaks = peaks[np.argsort(ratio_db[peaks])[::-1][:max_peaks]]
+        profiles.append(profile)
+        baselines.append(baseline)
+        ratios.append(ratio_db)
+        peaks_by_channel.append(np.sort(peaks))
+    audible_counts = [np.zeros(len(peaks), np.int64) for peaks in peaks_by_channel]
     total_frames = 0
-    for mag in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
-        total_frames += len(mag)
+    for mags in _iter_band_mags_multi(path, lo, hi, channels, start_frame, end_frame):
+        total_frames += len(mags)
         report_progress(min(2 / 3 + total_frames / (expected_frames * 3), 1.0))
-        if len(peaks):
-            audible_counts += np.sum(mag[:, peaks] > 2 * baseline[peaks], axis=0)
-    result_peaks = []
-    for j, p in enumerate(peaks):
-        # parabolic interpolation on log magnitude for sub-bin frequency
-        a, b, c = (np.log(profile[p + d] + 1e-12) if 0 <= p + d < len(profile) else np.log(profile[p] + 1e-12) for d in (-1, 0, 1))
-        denom = a - 2 * b + c
-        delta = 0.5 * (a - c) / denom if denom != 0 else 0.0
-        delta = float(np.clip(delta, -0.5, 0.5))
-        present = float(audible_counts[j] / total_frames) if total_frames else 0.0
-        result_peaks.append({
-            "bin": int(p + lo),
-            "freq_hz": float((p + lo + delta) * sr / N_FFT),
-            "level_db": float(20 * np.log10(profile[p] + 1e-12)),
-            "prominence_db": float(ratio_db[p]),
-            "amplitude": float(profile[p]),
-            "baseline": float(baseline[p]),
-            "frames_audible_pct": 100 * present,
-            "half_width_bins": PEAK_HALF_WIDTH,
-        })
-    res = {
-        "file": os.path.basename(path), "samplerate": sr, "channels": info.channels, "channel": channel,
-        "duration_s": duration, "analysis_duration_s": (end_frame - start_frame) / sr,
-        "analysis_start_s": start_frame / sr, "analysis_end_s": end_frame / sr,
-        "n_fft": N_FFT, "band_hz": [fmin, fmax],
-        "reference_mode": "hum-only" if hum_only else "quietest",
-        "quiet_frames": quiet_count, "quiet_total_s": float(quiet_count * HOP / sr),
-        "quiet_first_s": float(quiet_first), "quiet_last_s": float(quiet_last),
-        "peaks": result_peaks,
-    }
+        for index, peaks in enumerate(peaks_by_channel):
+            if len(peaks):
+                audible_counts[index] += np.sum(
+                    mags[:, index, peaks] > 2 * baselines[index][peaks], axis=0)
+    results = {}
+    for index, channel in enumerate(channels):
+        profile, baseline, ratio_db = profiles[index], baselines[index], ratios[index]
+        result_peaks = []
+        for j, p in enumerate(peaks_by_channel[index]):
+            a, b, c = (np.log(profile[p + d] + 1e-12) if 0 <= p + d < len(profile)
+                       else np.log(profile[p] + 1e-12) for d in (-1, 0, 1))
+            denom = a - 2 * b + c
+            delta = 0.5 * (a - c) / denom if denom != 0 else 0.0
+            delta = float(np.clip(delta, -0.5, 0.5))
+            present = float(audible_counts[index][j] / total_frames) if total_frames else 0.0
+            result_peaks.append({
+                "bin": int(p + lo),
+                "freq_hz": float((p + lo + delta) * sr / N_FFT),
+                "level_db": float(20 * np.log10(profile[p] + 1e-12)),
+                "prominence_db": float(ratio_db[p]),
+                "amplitude": float(profile[p]),
+                "baseline": float(baseline[p]),
+                "frames_audible_pct": 100 * present,
+                "half_width_bins": PEAK_HALF_WIDTH,
+            })
+        results[channel] = {
+            "file": os.path.basename(path), "samplerate": sr, "channels": info.channels, "channel": channel,
+            "duration_s": duration, "analysis_duration_s": (end_frame - start_frame) / sr,
+            "analysis_start_s": start_frame / sr, "analysis_end_s": end_frame / sr,
+            "n_fft": N_FFT, "band_hz": [fmin, fmax],
+            "reference_mode": "hum-only" if hum_only else "quietest",
+            "quiet_frames": int(quiet_counts[index]),
+            "quiet_total_s": float(quiet_counts[index] * HOP / sr),
+            "quiet_first_s": float(quiet_first[index]), "quiet_last_s": float(quiet_last[index]),
+            "peaks": result_peaks,
+        }
     report_progress(1.0)
-    return res
+    return results
 
 
 def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0,
@@ -289,6 +329,11 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
     lo, hi = band_bins(sr, fmin, fmax)
     bin_freqs = np.arange(lo, hi) * sr / N_FFT
     plot_freqs = fmin + (np.arange(height) + 0.5) * (fmax - fmin) / height
+    right_bins = np.clip(np.searchsorted(bin_freqs, plot_freqs), 1, len(bin_freqs) - 1)
+    left_bins = right_bins - 1
+    interpolation = ((plot_freqs - bin_freqs[left_bins])
+                     / (bin_freqs[right_bins] - bin_freqs[left_bins]))
+    in_band = (plot_freqs >= bin_freqs[0]) & (plot_freqs <= bin_freqs[-1])
     expected_frames = max(1, (end_frame - start_frame - N_FFT) // HOP + 1)
     report_progress = _progress_reporter(progress or (lambda fraction: _show_progress(f"Spectrogram {channel}", fraction)))
     palette = _spectrogram_palette()
@@ -332,18 +377,24 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         total_frames = 0
         report_progress(0.0)
         for mags in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
-            for mag in mags:
-                x = min(width - 1, int(((frame_offset * HOP + N_FFT / 2) / sr) * 10 * x_resolution))
+            frames = frame_offset + np.arange(len(mags))
+            columns = np.minimum(
+                width - 1,
+                ((frames * HOP + N_FFT / 2) / sr * 10 * x_resolution).astype(int))
+            group_starts = np.r_[0, np.flatnonzero(columns[1:] != columns[:-1]) + 1]
+            grouped_mags = np.maximum.reduceat(mags, group_starts, axis=0)
+            for x, spectrum in zip(columns[group_starts], grouped_mags):
                 if current_column is None:
                     current_column = x
                 elif x != current_column:
                     flush_column()
                     column_values.fill(0)
                     current_column = x
-                interpolated = np.interp(plot_freqs, bin_freqs, mag, left=0, right=0)
-                np.maximum(column_values, interpolated, out=column_values)
-                frame_offset += 1
-                total_frames += 1
+                values = spectrum[left_bins] * (1 - interpolation) + spectrum[right_bins] * interpolation
+                values[~in_band] = 0
+                np.maximum(column_values, values, out=column_values)
+            frame_offset += len(mags)
+            total_frames += len(mags)
             report_progress(min(total_frames / expected_frames, 1.0))
         flush_column()
         svg.write("</g>\n")
@@ -363,6 +414,19 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
             svg.write(f'<text x="{margin_left-5}" y="{y:.1f}" text-anchor="end">{frequency:.0f}</text>')
         svg.write("</g>\n</svg>\n")
     report_progress(1.0)
+    return output_path
+
+
+def _spectrogram_output_path(input_path, requested, channel, multiple_channels):
+    if requested:
+        stem, ext = os.path.splitext(requested)
+        channel_suffix = f"-{channel}" if multiple_channels else ""
+        output_path = f"{stem}{channel_suffix}{ext or '.svg'}"
+    else:
+        stem, _ = os.path.splitext(input_path)
+        output_path = f"{stem}-spectrogram-{channel}-{secrets.token_hex(4)}.svg"
+    if os.path.realpath(output_path) == os.path.realpath(input_path):
+        raise ValueError("spectrogram output must not resolve to the input file")
     return output_path
 
 
@@ -433,11 +497,9 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
     skip, remaining = pad, total
     subtype = info.subtype
     done = 0
-    custom_log = progress is None and log is not print
-    progress_callback = progress or (
-        (lambda fraction: log("\r" + _progress_line("Remove", fraction), end="", flush=True))
-        if custom_log else (lambda fraction: _show_progress("Remove", fraction)))
-    report_progress = _progress_reporter(progress_callback)
+    report_progress = _progress_reporter(
+        progress if progress is not None else lambda fraction: _show_progress("Remove", fraction))
+    log("Processing audio...")
 
     def run(buf):
         nonlocal carry, skip, remaining
@@ -476,8 +538,7 @@ def remove_hum(src, dst_file, res, mask_db=12.0, max_reduction_db=30.0, log=prin
         buf, e = run(buf)
         write(e)
         report_progress(1.0)
-        if custom_log:
-            log("")
+    log("Audio processing complete.")
 
 
 def make_output_path(src):
@@ -583,25 +644,19 @@ def main(argv=None):
         print("Analyzing...")
         channels = ([a.channel] if a.channel else
                     ["mix", "left", "right"] if a.mode == "analyze" else ["mix"])
-        results = {}
         try:
+            results = analyze_channels(
+                a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db,
+                a.max_peaks, channels, start=a.start or 0.0, end=a.end,
+                hum_only=a.hum_only)
             for channel in channels:
-                result = analyze(a.input, a.fmin, a.fmax, a.quiet_percent, a.min_prominence_db,
-                                 a.max_peaks, channel, start=a.start or 0.0, end=a.end,
-                                 hum_only=a.hum_only)
+                result = results[channel]
                 results[channel] = result
                 print_stats(result)
                 if a.spectrogram is not None:
-                    if a.spectrogram:
-                        requested = os.path.splitext(a.spectrogram)
-                        output_path = (f"{requested[0]}-{channel}{requested[1] or '.svg'}"
-                                       if len(channels) > 1 else f"{requested[0]}{requested[1] or '.svg'}")
-                    else:
-                        stem, _ = os.path.splitext(a.input)
-                        output_path = f"{stem}-spectrogram-{channel}-{secrets.token_hex(4)}.svg"
-                    if os.path.realpath(output_path) == os.path.realpath(a.input):
-                        ap.error("spectrogram output must not resolve to the input file")
                     try:
+                        output_path = _spectrogram_output_path(
+                            a.input, a.spectrogram, channel, len(channels) > 1)
                         write_spectrogram(a.input, output_path, channel, a.fmin, a.fmax,
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
                     except (ValueError, FileExistsError) as e:

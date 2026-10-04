@@ -77,6 +77,23 @@ def test_cli_analyze_defaults_to_all_channels_and_hum_only(tmp_path, capsys):
         assert "hum-only reference:" in output
 
 
+def test_analyze_channels_shares_file_reads(tmp_path, monkeypatch):
+    p = str(tmp_path / "a.wav")
+    make(p, seconds=2)
+    original_read_chunks = hr._read_chunks
+    read_count = 0
+
+    def count_reads(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        yield from original_read_chunks(*args, **kwargs)
+
+    monkeypatch.setattr(hr, "_read_chunks", count_reads)
+    results = hr.analyze_channels(p, progress=lambda _: None)
+    assert set(results) == {"mix", "left", "right"}
+    assert read_count == 3
+
+
 def test_analyze_progress_reaches_completion(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
@@ -99,6 +116,7 @@ def test_spectrogram_respects_time_frequency_bounds_and_resolution(tmp_path):
     text = "".join(root.itertext())
     assert "1500-2000" in text
     assert "1.0" in text and "3.0" in text
+    assert root.findall(".//{http://www.w3.org/2000/svg}path")
 
 
 @pytest.mark.parametrize("x_resolution,y_resolution", [
@@ -120,6 +138,15 @@ def test_spectrogram_escapes_svg_text(tmp_path):
     hr.write_spectrogram(p, out, channel="mix & <test>")
     text = "".join(ET.parse(out).getroot().itertext())
     assert "mix & <test>" in text
+
+
+def test_spectrogram_output_path_is_unique_and_protects_input(tmp_path):
+    source = str(tmp_path / "a.wav")
+    assert hr._spectrogram_output_path(source, "chart.svg", "left", True) == "chart-left.svg"
+    assert hr._spectrogram_output_path(source, "", "mix", False).startswith(
+        str(tmp_path / "a-spectrogram-mix-"))
+    with pytest.raises(ValueError, match="input"):
+        hr._spectrogram_output_path(source, source, "mix", False)
 
 
 def test_cli_generates_spectrogram_for_all_channels(tmp_path, capsys):
@@ -162,10 +189,13 @@ def test_remove_quiet_part_and_no_overwrite(tmp_path):
     before = open(p, "rb").read()
     res = hr.analyze(p)
     path, fh = hr.open_new_output(p)
-    progress = []
+    messages, progress = [], []
     with fh:
-        hr.remove_hum(p, fh, res, mask_db=6.0, log=lambda *a, **k: progress.append(a[0]))
-    assert any("Remove [" in line for line in progress)
+        hr.remove_hum(p, fh, res, mask_db=6.0, log=messages.append, progress=progress.append)
+    assert messages == ["Processing audio...", "Audio processing complete."]
+    assert progress[0] == 0
+    assert progress[-1] == 1
+    assert progress == sorted(progress)
     assert path != p and "-nohum-" in path
     assert open(p, "rb").read() == before
     x, _ = sf.read(p)
