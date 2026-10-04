@@ -287,12 +287,15 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
             if valid.any() and not hum_only:
                 level_histograms[index] += np.bincount(
                     _level_bins(levels[valid, index]), minlength=LEVEL_HISTOGRAM_BINS)
-    if np.any(valid_counts == 0):
-        raise ValueError("file too short to analyze one or more selected channels")
-    if np.any(valid_counts < 4):
-        raise ValueError("file is (nearly) digital silence in one or more selected channels")
+    active_channels = valid_counts >= 4
+    if not np.any(active_channels):
+        silent = ", ".join(channels)
+        raise ValueError(f"file is (nearly) digital silence on selected channels: {silent}")
     threshold_bins = []
-    for index in range(len(channels)):
+    for index, active in enumerate(active_channels):
+        if not active:
+            threshold_bins.append(0)
+            continue
         if hum_only:
             threshold_bins.append(LEVEL_HISTOGRAM_BINS - 1)
         else:
@@ -309,6 +312,8 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
         report_progress(min(1 / 3 + (frame_offset + len(mags)) / (expected_frames * 3), 2 / 3))
         levels = np.median(mags, axis=2)
         for index in range(len(channels)):
+            if not active_channels[index]:
+                continue
             valid_indices = np.flatnonzero(levels[:, index] > 1e-9)
             quiet = (valid_indices if hum_only else
                      valid_indices[_level_bins(levels[valid_indices, index]) <= threshold_bins[index]])
@@ -327,9 +332,17 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
                         sample[replacement] = mags[i, index].copy()
         frame_offset += len(mags)
     profiles, baselines, ratios, peaks_by_channel = [], [], [], []
-    for sample in quiet_samples:
-        if not sample:
-            raise ValueError("file is (nearly) digital silence")
+    for index, sample in enumerate(quiet_samples):
+        if not active_channels[index]:
+            profile = np.zeros(hi - lo, np.float32)
+            baseline = profile.copy()
+            ratio_db = profile.copy()
+            peaks = np.empty(0, np.int64)
+            profiles.append(profile)
+            baselines.append(baseline)
+            ratios.append(ratio_db)
+            peaks_by_channel.append(peaks)
+            continue
         profile = np.median(np.asarray(sample), axis=0)
         baseline = scipy.ndimage.median_filter(profile, size=NEIGHBOUR_BINS + 1, mode="nearest")
         ratio_db = 20 * np.log10((profile + 1e-12) / (baseline + 1e-12))
@@ -378,7 +391,8 @@ def analyze_channels(path, fmin=1500.0, fmax=3000.0, quiet_percent=10.0,
             "reference_mode": "hum-only" if hum_only else "quietest",
             "quiet_frames": int(quiet_counts[index]),
             "quiet_total_s": float(quiet_counts[index] * HOP / sr),
-            "quiet_first_s": float(quiet_first[index]), "quiet_last_s": float(quiet_last[index]),
+            "quiet_first_s": float(quiet_first[index] or 0),
+            "quiet_last_s": float(quiet_last[index] or 0),
             "peaks": result_peaks,
         }
     report_progress(1.0)
@@ -416,6 +430,12 @@ def _spectrogram_geometry(info, fmin, fmax, start, end, x_resolution, y_resoluti
 def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0,
                       start=0.0, end=None, x_resolution=1.0, y_resolution=1.0,
                       progress=None):
+    """Write an exclusive-create SVG spectrogram for the selected audio range.
+
+    x_resolution is pixels per 0.1 seconds; y_resolution is pixels per Hz. The raster plot
+    is capped by SPECTROGRAM_MAX_PIXELS. progress, when supplied, receives fractions from 0 to 1.
+    Raises FileExistsError if output_path already exists.
+    """
     info = sf.info(path)
     sr = info.samplerate
     start_frame, end_frame, plot_duration, width, height = _spectrogram_geometry(
@@ -464,6 +484,7 @@ def write_spectrogram(path, output_path, channel="mix", fmin=1500.0, fmax=3000.0
         report_progress(0.0)
         for mags in _iter_band_mags(path, lo, hi, channel, start_frame, end_frame):
             frames = frame_offset + np.arange(len(mags))
+            # Frame order guarantees pixel columns never decrease.
             columns = np.minimum(
                 width - 1,
                 ((frames * HOP + N_FFT / 2) / sr * 10 * x_resolution).astype(int))
@@ -739,6 +760,7 @@ def main(argv=None):
                 spectrogram_paths[channel] = output_path
         except (ValueError, FileExistsError) as e:
             ap.error(str(e))
+    spectrogram_failed = False
     if a.mode == "remove" and a.profile:
         with open(a.profile) as f:
             res = json.load(f)
@@ -764,6 +786,7 @@ def main(argv=None):
                                           a.start or 0.0, a.end, a.x_resolution, a.y_resolution)
                     except (OSError, ValueError) as e:
                         print(f"Spectrogram for {channel} failed: {e}", file=sys.stderr)
+                        spectrogram_failed = True
                         continue
                     print(f"Spectrogram written to {output_path}")
         except ValueError as e:
@@ -773,7 +796,7 @@ def main(argv=None):
         with open(a.save_profile, "w") as f:
             json.dump(res, f, indent=1)
     if a.mode == "analyze":
-        return 0
+        return 1 if spectrogram_failed else 0
     if not res["peaks"]:
         print("Nothing to remove.")
         return 1

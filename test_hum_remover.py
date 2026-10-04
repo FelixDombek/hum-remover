@@ -97,6 +97,18 @@ def test_analyze_channels_shares_file_reads(tmp_path, monkeypatch):
     assert read_count == 3
 
 
+def test_analyze_channels_reports_silent_channel_without_aborting(tmp_path):
+    p = str(tmp_path / "one-silent-channel.wav")
+    t = np.arange(SR * 2) / SR
+    samples = np.column_stack((0.01 * np.sin(2 * np.pi * 1800 * t), np.zeros_like(t)))
+    sf.write(p, samples, SR, subtype="FLOAT")
+    results = hr.analyze_channels(p, progress=lambda _: None)
+    assert results["left"]["peaks"]
+    assert results["mix"]["peaks"]
+    assert results["right"]["peaks"] == []
+    assert results["right"]["quiet_frames"] == 0
+
+
 def test_all_channel_progress_tracks_three_analysis_phases(tmp_path):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
@@ -255,6 +267,20 @@ def test_cli_validates_spectrogram_before_analysis(tmp_path, monkeypatch):
         hr.main(["analyze", p, "--spectrogram", "--x-resolution", "0"])
 
 
+def test_cli_rejects_profile_spectrogram_path_collision_before_analysis(tmp_path, monkeypatch):
+    p = str(tmp_path / "a.wav")
+    chart = str(tmp_path / "chart.svg")
+    make(p, seconds=2)
+
+    def unexpected_analysis(*args, **kwargs):
+        raise AssertionError("analysis must not run for colliding output paths")
+
+    monkeypatch.setattr(hr, "analyze_channels", unexpected_analysis)
+    with pytest.raises(SystemExit):
+        hr.main(["analyze", p, "--channel", "mix", "--spectrogram", chart,
+                 "--save-profile", chart])
+
+
 def test_cli_continues_other_spectrograms_after_one_fails(tmp_path, monkeypatch, capsys):
     p = str(tmp_path / "a.wav")
     make(p, seconds=2)
@@ -265,7 +291,7 @@ def test_cli_continues_other_spectrograms_after_one_fails(tmp_path, monkeypatch,
         raise FileExistsError("output appeared during analysis")
 
     monkeypatch.setattr(hr, "write_spectrogram", fail_chart)
-    assert hr.main(["analyze", p, "--spectrogram"]) == 0
+    assert hr.main(["analyze", p, "--spectrogram"]) == 1
     assert channels == ["mix", "left", "right"]
     assert capsys.readouterr().err.count("Spectrogram for") == 3
 
